@@ -53,3 +53,5 @@ report/
 # Turbo
 .turbo/
 *.cast
+# Generated/temp files
+test-metadata-manual.sh
