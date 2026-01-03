@@ -42,8 +42,14 @@ Must handle both IPv4 and IPv6, normalizing IPv6 to consistent format."
 <p align="center">
   <img src="./docs/assets/zeroshot-demo.gif" alt="Demo" width="700">
   <br>
-  <em>Sped up 10x — original recording: 77 minutes</em>
+  <em>Sped up 10x — 77 minutes, $22.61, 8 iterations until all validators approved</em>
 </p>
+
+**Why 8 iterations?** That's the validation loop working. The worker got rejected 7 times before all 6 requirements passed. A single agent would say "done!" after pass 1 with half the requirements broken.
+
+Watch the validators catch: wrong algorithm (fixed window instead of sliding), missing Retry-After calculation, forgotten IPv6 normalization, headers only on 429 responses instead of ALL responses.
+
+**This is what production-grade looks like.** Not "it compiles" — actually works, handles edge cases, meets every requirement. The adversarial tester doesn't just run tests — it uses the implementation like a real user and tries to break it.
 
 ---
 
