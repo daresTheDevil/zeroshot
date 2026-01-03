@@ -49,3 +49,6 @@ zeroshot-cluster-configs/
 *.pdf
 report/
 .eslintcache
+
+# Turbo
+.turbo/

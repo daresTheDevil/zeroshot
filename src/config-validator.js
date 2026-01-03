@@ -49,10 +49,9 @@ function validateConfig(config, depth = 0) {
   const basicResult = validateBasicStructure(config, depth);
   errors.push(...basicResult.errors);
   warnings.push(...basicResult.warnings);
-  if (basicResult.errors.length > 0) {
-    // Can't proceed with flow analysis if basic structure is broken
-    return { valid: false, errors, warnings };
-  }
+
+  // Note: We continue to other phases even if Phase 1 has errors,
+  // to collect ALL validation issues (especially semantic checks in Phase 6-9)
 
   // Conductor configs dynamically spawn agents - skip message flow analysis
   // The orchestrator validates the spawned config at CLUSTER_OPERATIONS execution time
@@ -79,6 +78,26 @@ function validateConfig(config, depth = 0) {
   const templateResult = validateTemplateVariables(config, depth);
   errors.push(...templateResult.errors);
   warnings.push(...templateResult.warnings);
+
+  // === PHASE 6: Hook semantic validation ===
+  const hookResult = validateHookSemantics(config);
+  errors.push(...hookResult.errors);
+  warnings.push(...hookResult.warnings);
+
+  // === PHASE 7: Rule coverage validation ===
+  const ruleResult = validateRuleCoverage(config);
+  errors.push(...ruleResult.errors);
+  warnings.push(...ruleResult.warnings);
+
+  // === PHASE 8: N-agent cycle detection ===
+  const cycleResult = detectNAgentCycles(config);
+  errors.push(...cycleResult.errors);
+  warnings.push(...cycleResult.warnings);
+
+  // === PHASE 9: Configuration semantic validation ===
+  const configResult = validateConfigSemantics(config);
+  errors.push(...configResult.errors);
+  warnings.push(...configResult.warnings);
 
   return {
     valid: errors.length === 0,
@@ -199,15 +218,7 @@ function validateBasicStructure(config, depth = 0) {
           }
         }
 
-        // Check for coverage gap (no catch-all rule)
-        const hasCatchAll = agent.modelRules.some(
-          (r) => r.iterations === 'all' || /^\d+\+$/.test(r.iterations)
-        );
-        if (!hasCatchAll) {
-          errors.push(
-            `${prefix}.modelRules has no catch-all rule (e.g., "all" or "5+"). High iterations will fail.`
-          );
-        }
+        // Note: Detailed coverage gap checking (iteration ranges) is done in Phase 7
       }
     }
   }
@@ -567,6 +578,10 @@ function validateLogicScripts(config) {
 /**
  * Phase 5: Validate template variables against jsonSchema
  * Ensures {{result.*}} references in hooks match defined schema properties
+ *
+ * Issue #14 - Gap 3:
+ * - Gap 3: Template variables don't exist (line 582-656)
+ *
  */
 function validateTemplateVariables(config, depth = 0) {
   const errors = [];
@@ -792,6 +807,615 @@ function formatValidationResult(result) {
   return lines.join('\n');
 }
 
+/**
+ * Phase 6: Hook semantic validation
+ * Catches runtime failures in hook execution (agent-hook-executor.js)
+ *
+ * Issue #14 - Gaps 1, 2, 7:
+ * - Gap 1: Hook action field missing (line 837-842)
+ * - Gap 2: Transform script output shape (line 846-866)
+ * - Gap 7: Conductor CLUSTER_OPERATIONS payload (line 869-888)
+ *
+ * @param {Object} config - Cluster configuration
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function validateHookSemantics(config) {
+  const errors = [];
+  const warnings = [];
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  for (const agent of config.agents) {
+    // Skip subclusters - they have their own validation
+    if (agent.type === 'subcluster') {
+      continue;
+    }
+
+    const hooks = agent.hooks || {};
+    const hookTypes = ['onComplete', 'onFailure', 'onTimeout'];
+
+    for (const hookType of hookTypes) {
+      const hook = hooks[hookType];
+      if (!hook) continue;
+
+      const prefix = `Agent '${agent.id}' hooks.${hookType}`;
+
+      // === GAP 1: Hook action field missing ===
+      // Causes runtime crash at agent-hook-executor.js:66
+      if (!hook.action) {
+        errors.push(
+          `[Gap 1] ${prefix}: Missing 'action' field. ` +
+            `Fix: Add "action": "publish_message" or "action": "execute_system_command"`
+        );
+      }
+
+      // === GAP 2: Transform script output shape validation ===
+      // Causes runtime crash at agent-hook-executor.js:148
+      if (hook.transform?.script) {
+        const script = hook.transform.script;
+
+        // Check if script returns an object with topic and content
+        // Simple heuristic: look for return statement with object
+        const hasReturnTopic = /return\s*\{[^}]*topic\s*:/i.test(script);
+        const hasReturnContent = /return\s*\{[^}]*content\s*:/i.test(script);
+
+        if (!hasReturnTopic) {
+          errors.push(
+            `[Gap 2] ${prefix}: Transform script must return object with 'topic' property. ` +
+              `Fix: return { topic: "TOPIC_NAME", content: {...} }`
+          );
+        }
+
+        if (!hasReturnContent) {
+          errors.push(
+            `[Gap 2] ${prefix}: Transform script must return object with 'content' property. ` +
+              `Fix: return { topic: "...", content: { data: result } }`
+          );
+        }
+      }
+
+      // === GAP 7: CLUSTER_OPERATIONS payload validation ===
+      // Causes runtime crash at orchestrator.js:722
+      if (
+        agent.role === 'conductor' &&
+        (hook.config?.topic === 'CLUSTER_OPERATIONS' ||
+          hook.transform?.script?.includes('CLUSTER_OPERATIONS'))
+      ) {
+        // Check if operations field is valid JSON structure
+        if (hook.transform?.script) {
+          const script = hook.transform.script;
+          // Look for operations field in return statement
+          const hasOperations = /operations\s*:/i.test(script);
+          if (!hasOperations) {
+            errors.push(
+              `[Gap 7] ${prefix}: CLUSTER_OPERATIONS message must include 'operations' field. ` +
+                `Fix: return { topic: "CLUSTER_OPERATIONS", content: { data: { operations: JSON.stringify([...]) } } }`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return { errors, warnings };
+}
+
+/**
+ * Phase 7: Rule coverage validation
+ * Catches gaps in model rules and prompt rules that cause runtime failures
+ *
+ * Issue #14 - Gaps 4, 5:
+ * - Gap 4: Model rule iteration gaps (line 916-963)
+ * - Gap 5: Prompt rule iteration gaps (line 965-1014)
+ *
+ * @param {Object} config - Cluster configuration
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function validateRuleCoverage(config) {
+  const errors = [];
+  const warnings = [];
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  for (const agent of config.agents) {
+    if (agent.type === 'subcluster') {
+      continue;
+    }
+
+    const maxIterations = agent.maxIterations || 30;
+
+    // === GAP 4: Model rule iteration gaps ===
+    // Causes runtime crash at agent-wrapper.js:154
+    if (agent.modelRules && Array.isArray(agent.modelRules)) {
+      const coveredIterations = new Set();
+
+      for (const rule of agent.modelRules) {
+        const pattern = rule.iterations;
+
+        if (pattern === 'all') {
+          // Covers all iterations
+          for (let i = 1; i <= maxIterations; i++) {
+            coveredIterations.add(i);
+          }
+        } else if (/^\d+$/.test(pattern)) {
+          // Single iteration: "5"
+          coveredIterations.add(parseInt(pattern));
+        } else if (/^\d+-\d+$/.test(pattern)) {
+          // Range: "1-3"
+          const [start, end] = pattern.split('-').map((n) => parseInt(n));
+          for (let i = start; i <= end; i++) {
+            coveredIterations.add(i);
+          }
+        } else if (/^\d+\+$/.test(pattern)) {
+          // Open-ended: "5+"
+          const start = parseInt(pattern);
+          for (let i = start; i <= maxIterations; i++) {
+            coveredIterations.add(i);
+          }
+        }
+      }
+
+      // Find gaps
+      const uncoveredIterations = [];
+      for (let i = 1; i <= maxIterations; i++) {
+        if (!coveredIterations.has(i)) {
+          uncoveredIterations.push(i);
+        }
+      }
+
+      if (uncoveredIterations.length > 0) {
+        // Group consecutive iterations for readability
+        const ranges = groupConsecutive(uncoveredIterations);
+        errors.push(
+          `[Gap 4] Agent '${agent.id}': Model rules have gaps at iterations ${ranges.join(', ')}. ` +
+            `Fix: Add catch-all rule { "iterations": "all", "model": "sonnet" } or extend existing ranges.`
+        );
+      }
+    }
+
+    // === GAP 5: Prompt rule iteration gaps ===
+    // Causes runtime crash at agent-wrapper.js:222
+    if (
+      agent.promptConfig &&
+      agent.promptConfig.type === 'rules' &&
+      agent.promptConfig.rules &&
+      Array.isArray(agent.promptConfig.rules)
+    ) {
+      const coveredIterations = new Set();
+
+      for (const rule of agent.promptConfig.rules) {
+        const pattern = rule.iterations;
+
+        if (pattern === 'all') {
+          for (let i = 1; i <= maxIterations; i++) {
+            coveredIterations.add(i);
+          }
+        } else if (/^\d+$/.test(pattern)) {
+          coveredIterations.add(parseInt(pattern));
+        } else if (/^\d+-\d+$/.test(pattern)) {
+          const [start, end] = pattern.split('-').map((n) => parseInt(n));
+          for (let i = start; i <= end; i++) {
+            coveredIterations.add(i);
+          }
+        } else if (/^\d+\+$/.test(pattern)) {
+          const start = parseInt(pattern);
+          for (let i = start; i <= maxIterations; i++) {
+            coveredIterations.add(i);
+          }
+        }
+      }
+
+      const uncoveredIterations = [];
+      for (let i = 1; i <= maxIterations; i++) {
+        if (!coveredIterations.has(i)) {
+          uncoveredIterations.push(i);
+        }
+      }
+
+      if (uncoveredIterations.length > 0) {
+        const ranges = groupConsecutive(uncoveredIterations);
+        errors.push(
+          `[Gap 5] Agent '${agent.id}': Prompt rules have gaps at iterations ${ranges.join(', ')}. ` +
+            `Fix: Add catch-all rule { "iterations": "all", "prompt": "..." } or extend existing ranges.`
+        );
+      }
+    }
+  }
+
+  return { errors, warnings };
+}
+
+/**
+ * Helper: Group consecutive numbers into ranges for readable output
+ * Example: [1, 2, 3, 5, 7, 8, 9] -> ["1-3", "5", "7-9"]
+ */
+function groupConsecutive(numbers) {
+  if (numbers.length === 0) return [];
+
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const ranges = [];
+  let rangeStart = sorted[0];
+  let rangeEnd = sorted[0];
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === rangeEnd + 1) {
+      rangeEnd = sorted[i];
+    } else {
+      // End of range
+      if (rangeStart === rangeEnd) {
+        ranges.push(`${rangeStart}`);
+      } else {
+        ranges.push(`${rangeStart}-${rangeEnd}`);
+      }
+      rangeStart = sorted[i];
+      rangeEnd = sorted[i];
+    }
+  }
+
+  // Add final range
+  if (rangeStart === rangeEnd) {
+    ranges.push(`${rangeStart}`);
+  } else {
+    ranges.push(`${rangeStart}-${rangeEnd}`);
+  }
+
+  return ranges;
+}
+
+/**
+ * Phase 8: N-agent cycle detection
+ * Detects circular dependencies with 3+ agents using DFS
+ *
+ * Issue #14 - Gap 6:
+ * - Gap 6: 3+ agent circular dependencies (line 1060-1165)
+ *
+ * @param {Object} config - Cluster configuration
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function detectNAgentCycles(config) {
+  const errors = [];
+  const warnings = [];
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  // Build agent dependency graph: agent -> [agents it depends on]
+  const agentGraph = new Map();
+  const topicProducers = new Map(); // topic -> [agentIds]
+
+  // Initialize graph
+  for (const agent of config.agents) {
+    if (agent.type === 'subcluster') continue;
+    agentGraph.set(agent.id, []);
+
+    // Track what topics this agent produces
+    const outputTopic = agent.hooks?.onComplete?.config?.topic;
+    if (outputTopic) {
+      if (!topicProducers.has(outputTopic)) {
+        topicProducers.set(outputTopic, []);
+      }
+      topicProducers.get(outputTopic).push(agent.id);
+    }
+  }
+
+  // Build dependencies: agent consumes topic -> depends on agents that produce it
+  for (const agent of config.agents) {
+    if (agent.type === 'subcluster') continue;
+
+    const dependencies = new Set();
+
+    for (const trigger of agent.triggers || []) {
+      const topic = trigger.topic;
+      if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') continue;
+      if (topic.endsWith('*')) continue; // Skip wildcards
+
+      const producers = topicProducers.get(topic) || [];
+      for (const producer of producers) {
+        if (producer !== agent.id) {
+          dependencies.add(producer);
+        }
+      }
+    }
+
+    agentGraph.set(agent.id, Array.from(dependencies));
+  }
+
+  // === GAP 6: Detect cycles with DFS ===
+  const visited = new Set();
+  const recursionStack = new Set();
+
+  function dfs(agentId, path) {
+    visited.add(agentId);
+    recursionStack.add(agentId);
+
+    const dependencies = agentGraph.get(agentId) || [];
+    for (const nextAgent of dependencies) {
+      if (recursionStack.has(nextAgent)) {
+        // Cycle detected - return the full cycle path
+        const cycleStartIndex = path.indexOf(nextAgent);
+        const cyclePath = [...path.slice(cycleStartIndex), nextAgent];
+        return cyclePath;
+      }
+
+      if (!visited.has(nextAgent)) {
+        const cycle = dfs(nextAgent, [...path, nextAgent]);
+        if (cycle) return cycle;
+      }
+    }
+
+    recursionStack.delete(agentId);
+    return null;
+  }
+
+  // Check all agents as starting points
+  for (const agentId of agentGraph.keys()) {
+    if (!visited.has(agentId)) {
+      const cycle = dfs(agentId, [agentId]);
+      if (cycle) {
+        // Check if cycle has escape logic (any agent in cycle has trigger logic)
+        const hasEscapeLogic = cycle.some((id) => {
+          const agent = config.agents.find((a) => a.id === id);
+          return agent?.triggers?.some((t) => t.logic);
+        });
+
+        const cycleStr = cycle.join(' → ');
+        if (!hasEscapeLogic) {
+          errors.push(
+            `[Gap 6] Circular dependency detected: ${cycleStr}. ` +
+              `Fix: Add logic conditions to break the loop, or set maxIterations on involved agents.`
+          );
+        } else {
+          warnings.push(
+            `Circular dependency detected: ${cycleStr}. ` +
+              `Has escape logic in triggers, but verify maxIterations is set to prevent infinite loops.`
+          );
+        }
+        // Only report first cycle to avoid noise
+        break;
+      }
+    }
+  }
+
+  return { errors, warnings };
+}
+
+/**
+ * Phase 9: Configuration semantic validation
+ * Validates configuration fields that can cause runtime failures
+ *
+ * Issue #14 - Gaps 8-15:
+ * - Gap 8: JSON schema structurally invalid (line 1219-1237)
+ * - Gap 9: Context sources never produced (line 1240-1283)
+ * - Gap 10: Isolation config invalid (line 1286-1312)
+ * - Gap 11: Agent ID conflicts across subclusters (line 1185-1212)
+ * - Gap 12: Load config file paths don't exist (line 1315-1323)
+ * - Gap 13: Task executor config invalid (line 1326-1352)
+ * - Gap 14: Context source format invalid (line 1270-1282)
+ * - Gap 15: Role references in logic (stricter) (line 1354-1383)
+ *
+ * @param {Object} config - Cluster configuration
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function validateConfigSemantics(config) {
+  const errors = [];
+  const warnings = [];
+
+  if (!config.agents || !Array.isArray(config.agents)) {
+    return { errors, warnings };
+  }
+
+  const fs = require('fs');
+  const path = require('path');
+
+  // === GAP 11: Agent ID conflicts across subclusters ===
+  // Collect all agent IDs recursively (including subclusters)
+  const allAgentIds = new Map(); // Map of agentId -> depth where first seen
+
+  function collectAgentIds(agents, depth = 0) {
+    if (!agents) return;
+
+    for (const agent of agents) {
+      if (!agent.id) continue; // Skip agents without IDs (caught in Phase 1)
+
+      if (allAgentIds.has(agent.id)) {
+        const firstSeenDepth = allAgentIds.get(agent.id);
+        errors.push(
+          `[Gap 11] Duplicate agent ID '${agent.id}' found across cluster hierarchy ` +
+            `(first at depth ${firstSeenDepth}, duplicate at depth ${depth}). ` +
+            `Fix: Ensure all agent IDs are unique across the entire cluster.`
+        );
+      } else {
+        allAgentIds.set(agent.id, depth);
+      }
+
+      if (agent.type === 'subcluster' && agent.config?.agents) {
+        collectAgentIds(agent.config.agents, depth + 1);
+      }
+    }
+  }
+
+  collectAgentIds(config.agents);
+
+  for (const agent of config.agents) {
+    if (agent.type === 'subcluster') continue;
+
+    const prefix = `Agent '${agent.id}'`;
+
+    // === GAP 8: JSON schema structurally invalid ===
+    if (agent.jsonSchema) {
+      try {
+        // Check if schema can be stringified (basic structural check)
+        JSON.stringify(agent.jsonSchema);
+
+        // Check required fields for JSON schema
+        if (typeof agent.jsonSchema !== 'object') {
+          errors.push(
+            `[Gap 8] ${prefix}: jsonSchema must be an object, got ${typeof agent.jsonSchema}. ` +
+              `Fix: Use valid JSON Schema format with 'type' and 'properties' fields.`
+          );
+        }
+      } catch (e) {
+        errors.push(
+          `[Gap 8] ${prefix}: jsonSchema is not valid JSON: ${e.message}. ` +
+            `Fix: Ensure schema is a valid JSON object.`
+        );
+      }
+    }
+
+    // === GAP 9: Context sources never produced (enhanced check) ===
+    // Already partially covered in Phase 2, but add stricter checks
+    if (agent.contextStrategy?.sources) {
+      const topicProducers = new Map();
+
+      // Build topic producers map
+      for (const a of config.agents) {
+        if (a.type === 'subcluster') continue;
+        const outputTopic = a.hooks?.onComplete?.config?.topic;
+        if (outputTopic) {
+          if (!topicProducers.has(outputTopic)) {
+            topicProducers.set(outputTopic, []);
+          }
+          topicProducers.get(outputTopic).push(a.id);
+        }
+      }
+
+      for (const source of agent.contextStrategy.sources) {
+        const topic = source.topic;
+        if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') continue;
+        if (topic.endsWith('*')) continue;
+
+        const producers = topicProducers.get(topic) || [];
+        if (producers.length === 0) {
+          warnings.push(
+            `[Gap 9] ${prefix}: Context source topic '${topic}' is never produced. ` +
+              `Agent will get empty context for this source.`
+          );
+        }
+
+        // === GAP 14: Context source format invalid ===
+        if (source.amount === undefined) {
+          warnings.push(
+            `[Gap 14] ${prefix}: Context source for topic '${topic}' missing 'amount' field. ` +
+              `Defaults may not be what you expect.`
+          );
+        }
+        if (source.strategy && !['latest', 'all', 'oldest'].includes(source.strategy)) {
+          errors.push(
+            `[Gap 14] ${prefix}: Context source strategy '${source.strategy}' is invalid. ` +
+              `Fix: Use 'latest', 'all', or 'oldest'.`
+          );
+        }
+      }
+    }
+
+    // === GAP 10: Isolation config invalid ===
+    if (agent.isolation) {
+      if (agent.isolation.type === 'docker') {
+        if (!agent.isolation.image) {
+          errors.push(
+            `[Gap 10] ${prefix}: Docker isolation requires 'image' field. ` +
+              `Fix: Add "image": "zeroshot-runner" or custom image name.`
+          );
+        }
+
+        // Check mount paths are absolute
+        if (agent.isolation.mounts) {
+          for (const mount of agent.isolation.mounts) {
+            if (mount.host && !path.isAbsolute(mount.host)) {
+              warnings.push(
+                `[Gap 10] ${prefix}: Docker mount host path '${mount.host}' is not absolute. ` +
+                  `May cause runtime errors.`
+              );
+            }
+          }
+        }
+      } else if (agent.isolation.type && agent.isolation.type !== 'worktree') {
+        errors.push(
+          `[Gap 10] ${prefix}: Unknown isolation type '${agent.isolation.type}'. ` +
+            `Fix: Use 'docker' or 'worktree'.`
+        );
+      }
+    }
+
+    // === GAP 12: Load config file paths don't exist ===
+    if (agent.loadConfig) {
+      const configPath = agent.loadConfig.path;
+      if (configPath && !fs.existsSync(configPath)) {
+        errors.push(
+          `[Gap 12] ${prefix}: Load config file '${configPath}' does not exist. ` +
+            `Fix: Check file path or remove loadConfig.`
+        );
+      }
+    }
+
+    // === GAP 13: Task executor config invalid ===
+    if (agent.taskExecutor) {
+      if (agent.taskExecutor.command === undefined) {
+        errors.push(
+          `[Gap 13] ${prefix}: Task executor missing 'command' field. ` +
+            `Fix: Add "command": "claude" or custom command.`
+        );
+      }
+
+      if (agent.taskExecutor.retries !== undefined) {
+        if (typeof agent.taskExecutor.retries !== 'number' || agent.taskExecutor.retries < 0) {
+          errors.push(
+            `[Gap 13] ${prefix}: Task executor 'retries' must be a non-negative number, got ${agent.taskExecutor.retries}. ` +
+              `Fix: Use a positive integer or 0.`
+          );
+        }
+      }
+
+      if (agent.taskExecutor.timeout !== undefined) {
+        if (typeof agent.taskExecutor.timeout !== 'number' || agent.taskExecutor.timeout <= 0) {
+          errors.push(
+            `[Gap 13] ${prefix}: Task executor 'timeout' must be a positive number, got ${agent.taskExecutor.timeout}. ` +
+              `Fix: Use a positive number in milliseconds.`
+          );
+        }
+      }
+    }
+
+    // === GAP 15: Stricter role reference validation ===
+    // Upgrade from WARNING to ERROR when role is used in critical logic
+    const roles = new Set(config.agents.filter((a) => a.type !== 'subcluster').map((a) => a.role));
+
+    for (const trigger of agent.triggers || []) {
+      if (trigger.logic?.script) {
+        const script = trigger.logic.script;
+        const roleMatches = script.match(/getAgentsByRole\(['"](\w+)['"]\)/g);
+
+        if (roleMatches) {
+          for (const match of roleMatches) {
+            const role = match.match(/['"](\w+)['"]/)[1];
+            if (!roles.has(role)) {
+              // Check if the logic depends on this role for critical decisions
+              const isCritical =
+                /\.length\s*[><=!]/.test(script) || // Checking count
+                /allResponded/.test(script) || // Waiting for responses
+                /hasConsensus/.test(script); // Consensus check
+
+              if (isCritical) {
+                errors.push(
+                  `[Gap 15] ${prefix}: Logic references role '${role}' which doesn't exist. ` +
+                    `This will cause logic to fail. Fix: Add agent with role '${role}' or update logic.`
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return { errors, warnings };
+}
+
 module.exports = {
   validateConfig,
   isConductorConfig,
@@ -806,4 +1430,10 @@ module.exports = {
   extractTemplateVariables,
   extractSchemaProperties,
   validateAgentTemplateVariables,
+  // Phase 6-9: Semantic validation
+  validateHookSemantics,
+  validateRuleCoverage,
+  detectNAgentCycles,
+  validateConfigSemantics,
+  groupConsecutive,
 };
