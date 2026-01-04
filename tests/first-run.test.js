@@ -21,20 +21,13 @@ const TEST_STORAGE_DIR = path.join(
 );
 const TEST_SETTINGS_FILE = path.join(TEST_STORAGE_DIR, 'settings.json');
 
-// Set env var IMMEDIATELY at module load time - before any other test can interfere
-// This is critical because c8 coverage may preload modules differently
-process.env.ZEROSHOT_SETTINGS_FILE = TEST_SETTINGS_FILE;
-
-// Force fresh module load by clearing cache for all settings-related modules
-// Clear BEFORE requiring to ensure they pick up our env var
+// Module paths for cache management
 const settingsPath = require.resolve('../lib/settings');
 const firstRunPath = require.resolve('../cli/lib/first-run');
-delete require.cache[settingsPath];
-delete require.cache[firstRunPath];
 
-// Now require fresh modules that will read our env var
-const settingsModule = require('../lib/settings');
-const firstRunModule = require('../cli/lib/first-run');
+// Variables to hold fresh module references (set in before() hook)
+let settingsModule;
+let firstRunModule;
 
 describe('First-Run Setup', function () {
   this.timeout(10000);
@@ -44,6 +37,19 @@ describe('First-Run Setup', function () {
     if (!fs.existsSync(TEST_STORAGE_DIR)) {
       fs.mkdirSync(TEST_STORAGE_DIR, { recursive: true });
     }
+
+    // Set env var BEFORE requiring modules
+    // This must happen in before() because other tests' after() hooks may have deleted it
+    process.env.ZEROSHOT_SETTINGS_FILE = TEST_SETTINGS_FILE;
+
+    // Force fresh module load by clearing cache for all settings-related modules
+    // This ensures modules read OUR env var, not a stale cached value
+    delete require.cache[settingsPath];
+    delete require.cache[firstRunPath];
+
+    // Now require fresh modules that will read our env var
+    settingsModule = require('../lib/settings');
+    firstRunModule = require('../cli/lib/first-run');
 
     // Verify env var is set correctly (sanity check)
     assert.strictEqual(
