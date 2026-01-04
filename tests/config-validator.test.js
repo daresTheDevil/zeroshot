@@ -122,8 +122,9 @@ describe('Config Validator', function () {
   });
 
   describe('modelRules validation', function () {
+    // Note: modelRules catch-all validation is in validateRuleCoverage, called by validateConfig
     it('should reject modelRules without catch-all', function () {
-      const result = validateBasicStructure({
+      const result = validateConfig({
         agents: [
           {
             id: 'worker',
@@ -136,11 +137,11 @@ describe('Config Validator', function () {
           },
         ],
       });
-      assert.ok(result.errors.some((e) => e.includes('no catch-all rule')));
+      assert.ok(result.errors.some((e) => e.includes('Add catch-all rule')));
     });
 
     it('should accept modelRules with "all" catch-all', function () {
-      const result = validateBasicStructure({
+      const result = validateConfig({
         agents: [
           {
             id: 'worker',
@@ -157,7 +158,7 @@ describe('Config Validator', function () {
     });
 
     it('should accept modelRules with "N+" catch-all', function () {
-      const result = validateBasicStructure({
+      const result = validateConfig({
         agents: [
           {
             id: 'worker',
