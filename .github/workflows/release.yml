@@ -34,6 +34,12 @@ jobs:
           # NOTE: Do NOT set persist-credentials: false here
           # Semantic-release needs git credentials to query remote tags
 
+      - name: Fetch all tags
+        run: |
+          git fetch --tags --force
+          echo "Available tags:"
+          git tag -l | tail -10
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
