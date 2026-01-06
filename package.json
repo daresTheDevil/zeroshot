@@ -82,6 +82,7 @@
     "cluster-templates/",
     "hooks/",
     "docker/",
+    "scripts/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
