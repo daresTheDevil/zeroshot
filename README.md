@@ -8,7 +8,7 @@
 
 > **2024** was the year of LLMs. **2025** was the year of agents. **2026** is the year of agent clusters.
 
-**Multi-agent coding CLI built on Claude Code.**
+**Autonomous engineering teams for Claude Code.**
 
 ## Install
 
