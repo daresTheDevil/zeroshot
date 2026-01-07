@@ -1,3 +1,10 @@
+## [5.2.1](https://github.com/covibes/zeroshot/compare/v5.2.0...v5.2.1) (2026-01-07)
+
+
+### Bug Fixes
+
+* **git-pusher:** handle clusters without validators ([f4cec4d](https://github.com/covibes/zeroshot/commit/f4cec4d179273cb4d46240cad9b3b19be497690e))
+
 # [5.2.0](https://github.com/covibes/zeroshot/compare/v5.1.0...v5.2.0) (2026-01-07)
 
 
