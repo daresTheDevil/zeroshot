@@ -15,6 +15,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// Direct API caller for fast conductor classification
+const { callDirectApi, shouldUseDirectApi } = require('./direct-api-caller');
+
 /**
  * Validate and sanitize error messages.
  * Detects TypeScript type annotations that may have leaked into error storage.
@@ -97,7 +100,18 @@ function extractErrorContext({ output, statusOutput, taskId, isNotFound = false 
     return sanitizeErrorMessage('Task failed with no output (check if task was interrupted or timed out)');
   }
 
-  // Common error patterns
+  // Extract non-JSON lines only (JSON lines contain "is_error": true which falsely matches)
+  const nonJsonLines = lastOutput
+    .split('\n')
+    .filter((line) => {
+      const trimmed = line.trim();
+      // Skip JSON objects and JSON-like content
+      return trimmed && !trimmed.startsWith('{') && !trimmed.startsWith('"');
+    })
+    .join('\n');
+
+  // Common error patterns - match against non-JSON content
+  const textToSearch = nonJsonLines || lastOutput;
   const errorPatterns = [
     /Error:\s*(.+)/i,
     /error:\s*(.+)/i,
@@ -107,7 +121,7 @@ function extractErrorContext({ output, statusOutput, taskId, isNotFound = false 
   ];
 
   for (const pattern of errorPatterns) {
-    const match = lastOutput.match(pattern);
+    const match = textToSearch.match(pattern);
     if (match) {
       return sanitizeErrorMessage(match[1].slice(0, 200));
     }
@@ -325,6 +339,12 @@ function ensureDangerousGitHook() {
  * @returns {Promise<Object>} Result object { success, output, error }
  */
 async function spawnClaudeTask(agent, context) {
+  // FAST PATH: Direct API for conductor classification
+  // Bypasses Claude CLI overhead (~27s → ~1s) for simple classification tasks
+  if (shouldUseDirectApi(agent.config)) {
+    return spawnClaudeTaskDirectApi(agent, context);
+  }
+
   const ctPath = getClaudeTasksPath();
   const cwd = agent.config.cwd || process.cwd();
 
@@ -490,6 +510,125 @@ async function spawnClaudeTask(agent, context) {
 
   // Now follow the logs and stream output
   return followClaudeTaskLogs(agent, taskId);
+}
+
+/**
+ * FAST PATH: Execute conductor task via direct Anthropic API
+ * Bypasses Claude CLI (~27s overhead) for simple classification tasks
+ *
+ * @param {Object} agent - Agent instance
+ * @param {String} context - Context to pass to Claude
+ * @returns {Promise<Object>} Result object { success, output, error, tokenUsage }
+ */
+async function spawnClaudeTaskDirectApi(agent, context) {
+  const startTime = Date.now();
+
+  agent._log(`⚡ Agent ${agent.id}: Using direct API (fast path)`);
+  agent._publishLifecycle('DIRECT_API_STARTED', { model: agent._selectModel() });
+
+  // Extract system prompt from agent config
+  // The conductor template has a 'system' field in the prompt object
+  let systemPrompt = '';
+  if (agent.config.prompt?.system) {
+    // Replace template variables in system prompt
+    systemPrompt = agent.config.prompt.system;
+  }
+
+  // The context already has the task content, use it as the user prompt
+  const userPrompt = context;
+
+  try {
+    const result = await callDirectApi({
+      prompt: userPrompt,
+      model: agent._selectModel(),
+      jsonSchema: agent.config.jsonSchema,
+      systemPrompt,
+      maxTokens: 1024,
+    });
+
+    const totalDurationMs = Date.now() - startTime;
+
+    if (result.success) {
+      agent._publishLifecycle('DIRECT_API_COMPLETED', {
+        durationMs: totalDurationMs,
+        durationApiMs: result.durationApiMs,
+        inputTokens: result.usage?.inputTokens,
+        outputTokens: result.usage?.outputTokens,
+      });
+
+      // Format output to match expected structure from Claude CLI
+      const output = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        duration_ms: totalDurationMs,
+        duration_api_ms: result.durationApiMs,
+        result: result.result,
+        usage: {
+          input_tokens: result.usage?.inputTokens || 0,
+          output_tokens: result.usage?.outputTokens || 0,
+        },
+      });
+
+      // Broadcast the result as AGENT_OUTPUT for consistency with CLI path
+      agent._publish({
+        topic: 'AGENT_OUTPUT',
+        receiver: 'broadcast',
+        content: {
+          text: output,
+          data: {
+            type: 'json',
+            line: output,
+            agent: agent.id,
+            role: agent.role,
+            iteration: agent.iteration,
+          },
+        },
+      });
+
+      return {
+        success: true,
+        output,
+        result: result.result,
+        tokenUsage: {
+          inputTokens: result.usage?.inputTokens || 0,
+          outputTokens: result.usage?.outputTokens || 0,
+          durationMs: totalDurationMs,
+          durationApiMs: result.durationApiMs,
+        },
+      };
+    } else {
+      agent._publishLifecycle('DIRECT_API_FAILED', {
+        error: result.error,
+        durationMs: totalDurationMs,
+      });
+
+      return {
+        success: false,
+        output: '',
+        error: result.error,
+        tokenUsage: {
+          durationMs: totalDurationMs,
+        },
+      };
+    }
+  } catch (error) {
+    const totalDurationMs = Date.now() - startTime;
+
+    agent._publishLifecycle('DIRECT_API_FAILED', {
+      error: error.message,
+      durationMs: totalDurationMs,
+    });
+
+    return {
+      success: false,
+      output: '',
+      error: error.message,
+      tokenUsage: {
+        durationMs: totalDurationMs,
+      },
+    };
+  }
 }
 
 /**

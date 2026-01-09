@@ -6,6 +6,7 @@
       "id": "junior-conductor",
       "role": "conductor",
       "model": "haiku",
+      "useDirectApi": true,
       "outputFormat": "json",
       "jsonSchema": {
         "type": "object",
@@ -59,6 +60,7 @@
       "id": "senior-conductor",
       "role": "conductor",
       "model": "sonnet",
+      "useDirectApi": true,
       "outputFormat": "json",
       "jsonSchema": {
         "type": "object",
