@@ -1,0 +1,228 @@
+UPDATE THIS FILE when making architectural changes, adding patterns, or changing conventions.
+
+# Zeroshot: Multi-Agent Coordination Engine
+
+Operational rules and references for automated agents working on this repo. Install:
+`npm i -g @covibes/zeroshot` or `npm link` (dev).
+
+## CRITICAL RULES
+
+- Never spawn without permission. Do not run `zeroshot run <id>` unless the user explicitly asks to run it.
+- Never use git in validator prompts. Validate files directly.
+- Never ask questions. Agents run non-interactively; make autonomous decisions.
+- Never edit `CLAUDE.md` unless explicitly asked to update docs.
+
+Worker git operations are allowed only with isolation (`--worktree`, `--docker`, `--pr`, `--ship`). They are forbidden without isolation.
+
+Read-only safe commands: `zeroshot list`, `zeroshot status`, `zeroshot logs`
+
+Destructive commands (need permission): `zeroshot kill`, `zeroshot clear`, `zeroshot purge`
+
+## Where to Look
+
+| Concept                  | File                                |
+| ------------------------ | ----------------------------------- |
+| Conductor classification | `src/conductor-bootstrap.js`        |
+| Base templates           | `cluster-templates/base-templates/` |
+| Message bus              | `src/message-bus.js`                |
+| Ledger (SQLite)          | `src/ledger.js`                     |
+| Trigger evaluation       | `src/logic-engine.js`               |
+| Agent wrapper            | `src/agent-wrapper.js`              |
+| TUI dashboard            | `src/tui/`                          |
+| Docker mounts/env        | `lib/docker-config.js`              |
+| Container lifecycle      | `src/isolation-manager.js`          |
+| Settings                 | `lib/settings.js`                   |
+
+## CLI Quick Reference
+
+```bash
+# Flag cascade: --ship -> --pr -> --worktree
+zeroshot run 123                  # Local, no isolation
+zeroshot run 123 --worktree       # Git worktree isolation
+zeroshot run 123 --pr             # Worktree + create PR
+zeroshot run 123 --ship           # Worktree + PR + auto-merge
+zeroshot run 123 --docker         # Docker container isolation
+zeroshot run 123 -d               # Background (daemon) mode
+
+# Management
+zeroshot list                     # All clusters (--json)
+zeroshot status <id>              # Cluster details
+zeroshot logs <id> [-f]           # Stream logs
+zeroshot resume <id> [prompt]     # Resume failed cluster
+zeroshot stop <id>                # Graceful stop
+zeroshot kill <id>                # Force kill
+
+# Utilities
+zeroshot watch                    # TUI dashboard
+zeroshot export <id>              # Export conversation
+zeroshot agents list              # Available agents
+zeroshot settings                 # View/modify settings
+```
+
+UX modes:
+
+- Foreground (`zeroshot run`): streams logs, Ctrl+C stops cluster.
+- Daemon (`-d`): background, Ctrl+C detaches.
+- Attach (`zeroshot attach`): connect to daemon, Ctrl+C detaches only.
+
+Settings: `maxModel` (opus/sonnet/haiku cost ceiling), `defaultConfig`, `logLevel`.
+
+## Architecture
+
+Pub/sub message bus + SQLite ledger. Agents subscribe to topics, execute on trigger match, publish results.
+
+```
+Agent A -> publish() -> SQLite Ledger -> LogicEngine -> trigger match -> Agent B executes
+```
+
+### Core Primitives
+
+| Primitive    | Purpose                                                     |
+| ------------ | ----------------------------------------------------------- |
+| Topic        | Named message channel (`ISSUE_OPENED`, `VALIDATION_RESULT`) |
+| Trigger      | Condition to wake agent (`{ topic, action, logic }`)        |
+| Logic Script | JS predicate for complex conditions                         |
+| Hook         | Post-task action (publish message, execute command)         |
+
+### Agent Configuration (Minimal)
+
+```json
+{
+  "id": "worker",
+  "role": "implementation",
+  "model": "sonnet",
+  "triggers": [{ "topic": "ISSUE_OPENED", "action": "execute_task" }],
+  "prompt": "Implement the requested feature...",
+  "hooks": {
+    "onComplete": {
+      "action": "publish_message",
+      "config": { "topic": "IMPLEMENTATION_READY" }
+    }
+  }
+}
+```
+
+### Logic Script API
+
+```javascript
+// Ledger (auto-scoped to cluster)
+ledger.query({ topic, sender, since, limit });
+ledger.findLast({ topic });
+ledger.count({ topic });
+
+// Cluster
+cluster.getAgents();
+cluster.getAgentsByRole('validator');
+
+// Helpers
+helpers.allResponded(agents, topic, since);
+helpers.hasConsensus(topic, since);
+```
+
+## Conductor: 2D Classification
+
+Classifies tasks on Complexity x TaskType, routes to parameterized templates.
+
+| Complexity | Description            | Validators |
+| ---------- | ---------------------- | ---------- |
+| TRIVIAL    | 1 file, mechanical     | 0          |
+| SIMPLE     | 1 concern              | 1          |
+| STANDARD   | Multi-file             | 3          |
+| CRITICAL   | Auth/payments/security | 5          |
+
+| TaskType | Action                |
+| -------- | --------------------- |
+| INQUIRY  | Read-only exploration |
+| TASK     | Implement new feature |
+| DEBUG    | Fix broken code       |
+
+Base templates: `single-worker`, `worker-validator`, `debug-workflow`, `full-workflow`.
+
+## Isolation Modes
+
+| Mode     | Flag         | Use When                                           |
+| -------- | ------------ | -------------------------------------------------- |
+| Worktree | `--worktree` | Quick isolated work, PR workflows                  |
+| Docker   | `--docker`   | Full isolation, risky experiments, parallel agents |
+
+Worktree: lightweight git branch isolation (<1s setup).
+Docker: fresh git clone in container, credentials mounted, auto-cleanup.
+
+## Docker Mount Configuration
+
+Configurable credential mounts for `--docker` mode. See `lib/docker-config.js`.
+
+| Setting                | Type          | Default  | Description                                           |
+| ---------------------- | ------------- | -------- | ----------------------------------------------------- | ---------------------------------------- |
+| `dockerMounts`         | `Array<string | object>` | `['gh','git','ssh']`                                  | Presets or `{host, container, readonly}` |
+| `dockerEnvPassthrough` | `string[]`    | `[]`     | Extra env vars (supports `VAR`, `VAR_*`, `VAR=value`) |
+| `dockerContainerHome`  | `string`      | `/root`  | Container home for `$HOME` expansion                  |
+
+Mount presets: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`.
+
+Env var syntax:
+
+- `VAR` -> pass if set in host env
+- `VAR_*` -> pass all matching (e.g., `TF_VAR_*`)
+- `VAR=value` -> always set to value
+- `VAR=` -> always set to empty string
+
+Config priority: CLI flags > `ZEROSHOT_DOCKER_MOUNTS` env > settings > defaults.
+
+```bash
+# Persistent config
+zeroshot settings set dockerMounts '["gh","git","ssh","aws"]'
+
+# Per-run override
+zeroshot run 123 --docker --mount ~/.custom:/root/.custom:ro
+
+# Disable all mounts
+zeroshot run 123 --docker --no-mounts
+```
+
+## Adversarial Tester (STANDARD+ only)
+
+Core principle: tests passing != implementation works. The ONLY verification is: USE IT YOURSELF.
+
+1. Read issue -> understand requirements
+2. Look at code -> figure out how to invoke
+3. Run it -> did it work?
+4. Try to break it -> edge cases
+5. Verify each requirement -> evidence (command + output)
+
+## Persistence
+
+| File                        | Content               |
+| --------------------------- | --------------------- |
+| `~/.zeroshot/clusters.json` | Cluster metadata      |
+| `~/.zeroshot/<id>.db`       | SQLite message ledger |
+
+Clusters survive crashes. Resume: `zeroshot resume <id>`.
+
+## Known Limitations
+
+Bash subprocess output not streamed: Claude CLI returns `tool_result` after subprocess completes.
+Long scripts show no output until done.
+
+## Fixed Bugs (Reference)
+
+### Template Agent CWD Injection (2026-01-03)
+
+Bug: `--ship` mode created worktree but template agents (planning, implementation, validator)
+ran in main directory instead, polluting it with uncommitted changes.
+
+Root cause: `_opAddAgents()` didn't inject cluster's worktree cwd into dynamically spawned
+template agents. Initial agents got cwd via `startCluster()`, but template agents loaded
+later via conductor classification missed it.
+
+Fix: added cwd injection to `_opAddAgents()` and resume path in `orchestrator.js`.
+Test: `tests/worktree-cwd-injection.test.js`.
+
+## Mechanical Enforcement
+
+| Antipattern               | Enforcement      |
+| ------------------------- | ---------------- |
+| Dangerous fallbacks       | ESLint ERROR     |
+| Manual git tags           | Pre-push hook    |
+| Git in validator prompts  | Config validator |
+| Multiple impl files (-v2) | Pre-commit hook  |
