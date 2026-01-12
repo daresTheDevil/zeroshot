@@ -780,9 +780,24 @@ function followClaudeTaskLogs(agent, taskId) {
         // Use flexible whitespace matching in case spacing changes
         const isCompleted = /Status:\s+completed/i.test(cleanStdout);
         const isFailed = /Status:\s+failed/i.test(cleanStdout);
+        // BUGFIX: Handle "stale (process died)" status - watcher died before updating status
+        // Check if task produced a successful result (structured_output in log file)
+        const isStale = /Status:\s+stale/i.test(cleanStdout);
 
-        if (isCompleted || isFailed) {
-          const success = isCompleted;
+        if (isCompleted || isFailed || isStale) {
+          // For stale tasks, check log file for successful result
+          let success = isCompleted;
+          if (isStale && output) {
+            // Look for structured_output in accumulated output - indicates success
+            const hasStructuredOutput = /"structured_output"\s*:/.test(output);
+            const hasSuccessResult = /"subtype"\s*:\s*"success"/.test(output);
+            success = hasStructuredOutput || hasSuccessResult;
+            if (!agent.quiet) {
+              agent._log(
+                `[Agent ${agent.id}] Task ${taskId} is stale - recovered as ${success ? 'SUCCESS' : 'FAILURE'} based on output analysis`
+              );
+            }
+          }
 
           // Read any final content
           pollLogFile();
