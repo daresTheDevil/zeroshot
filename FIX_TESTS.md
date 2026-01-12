@@ -116,8 +116,10 @@
     - Test: should read agent output from log file, not spawn stdout
     - Error: Timeout of 150000ms exceeded. For async tests and hooks, ensure "done()" is called; if returning a Promise, ensure it resolves.
     - Location: tests/unit/isolated-mode-output-capture.test.js
+    - Status: Fixed (pending verification)
 
 15. Isolated Mode Output Capture
     - Hook: "after each" hook for "should read agent output from log file, not spawn stdout"
     - Error: Timeout of 2000ms exceeded. For async tests and hooks, ensure "done()" is called; if returning a Promise, ensure it resolves.
     - Location: tests/unit/isolated-mode-output-capture.test.js
+    - Status: Fixed (pending verification)
