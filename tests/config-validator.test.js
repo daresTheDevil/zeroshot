@@ -174,8 +174,8 @@ describe('Config Validator', function () {
       assert.ok(!result.errors.some((e) => e.includes('catch-all')));
     });
 
-    it('should reject invalid model name', function () {
-      const result = validateBasicStructure({
+    it('should warn on invalid model name', function () {
+      const result = validateConfig({
         agents: [
           {
             id: 'worker',
@@ -185,7 +185,7 @@ describe('Config Validator', function () {
           },
         ],
       });
-      assert.ok(result.errors.some((e) => e.includes("must be 'opus', 'sonnet', or 'haiku'")));
+      assert.ok(result.warnings.some((w) => w.includes('model "gpt4"') && w.includes('anthropic')));
     });
   });
 
@@ -1336,7 +1336,10 @@ describe('Config Validator', function () {
     // Test 3: Multiple agents, one invalid
     it('should only error for invalid agent', function () {
       const config = {
-        agents: [createAgent('valid-worker', ['a'], ['a']), createAgent('invalid-worker', ['b'], ['nonexistent'])],
+        agents: [
+          createAgent('valid-worker', ['a'], ['a']),
+          createAgent('invalid-worker', ['b'], ['nonexistent']),
+        ],
       };
       const result = validateTemplateVariables(config);
       assert.strictEqual(result.errors.length, 1);
@@ -1523,11 +1526,7 @@ describe('Config Validator', function () {
       const templateErrors = result.errors.filter(
         (e) => e.includes('{{result.') || e.includes('not defined in jsonSchema')
       );
-      assert.strictEqual(
-        templateErrors.length,
-        0,
-        `Template errors: ${templateErrors.join(', ')}`
-      );
+      assert.strictEqual(templateErrors.length, 0, `Template errors: ${templateErrors.join(', ')}`);
     });
 
     // Test 4: Real config: conductor-bootstrap.json (if exists)
@@ -1552,11 +1551,7 @@ describe('Config Validator', function () {
       const templateErrors = result.errors.filter(
         (e) => e.includes('{{result.') || e.includes('not defined in jsonSchema')
       );
-      assert.strictEqual(
-        templateErrors.length,
-        0,
-        `Template errors: ${templateErrors.join(', ')}`
-      );
+      assert.strictEqual(templateErrors.length, 0, `Template errors: ${templateErrors.join(', ')}`);
     });
 
     // Test 5: Non-JSON agents pass without template validation

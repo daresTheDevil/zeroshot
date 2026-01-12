@@ -1,14 +1,15 @@
 /**
  * ClaudeTaskRunner - Production implementation of TaskRunner
  *
- * Executes Claude tasks by spawning the `zeroshot task run` CLI command,
+ * Executes provider tasks by spawning the `zeroshot task run` CLI command,
  * following logs, and assembling results.
  */
 
 const { spawn, exec, execSync } = require('child_process');
 const fs = require('fs');
 const TaskRunner = require('./task-runner');
-const { getClaudeCommand } = require('../lib/settings');
+const { loadSettings } = require('../lib/settings');
+const { getProvider } = require('./providers');
 
 class ClaudeTaskRunner extends TaskRunner {
   /**
@@ -36,7 +37,7 @@ class ClaudeTaskRunner extends TaskRunner {
   }
 
   /**
-   * Execute a Claude task via zeroshot CLI
+   * Execute a task via zeroshot CLI
    *
    * @param {string} context - Full prompt/context
    * @param {{agentId?: string, model?: string, outputFormat?: string, jsonSchema?: any, strictSchema?: boolean, cwd?: string, isolation?: any}} options - Execution options
@@ -45,7 +46,11 @@ class ClaudeTaskRunner extends TaskRunner {
   async run(context, options = {}) {
     const {
       agentId = 'unknown',
-      model = 'sonnet',
+      provider,
+      model = null,
+      modelLevel = null,
+      modelSpec: explicitModelSpec = null,
+      reasoningEffort = null,
       outputFormat = 'stream-json',
       jsonSchema = null,
       strictSchema = false, // false = live streaming (default), true = CLI schema enforcement (no streaming)
@@ -53,9 +58,33 @@ class ClaudeTaskRunner extends TaskRunner {
       isolation = null,
     } = options;
 
+    const settings = loadSettings();
+    const providerName = provider || settings.defaultProvider || 'anthropic';
+    const providerModule = getProvider(providerName);
+    const providerSettings = settings.providerSettings?.[providerName] || {};
+    const levelOverrides = providerSettings.levelOverrides || {};
+
+    let resolvedModelSpec = explicitModelSpec;
+    if (!resolvedModelSpec) {
+      if (model) {
+        resolvedModelSpec = { model, reasoningEffort };
+      } else {
+        const level =
+          modelLevel || providerSettings.defaultLevel || providerModule.getDefaultLevel();
+        resolvedModelSpec = providerModule.resolveModelSpec(level, levelOverrides);
+        if (reasoningEffort) {
+          resolvedModelSpec = { ...resolvedModelSpec, reasoningEffort };
+        }
+      }
+    }
+
     // Isolation mode delegates to separate method
     if (isolation?.enabled) {
-      return this._runIsolated(context, options);
+      return this._runIsolated(context, {
+        ...options,
+        provider: providerName,
+        modelSpec: resolvedModelSpec,
+      });
     }
 
     const ctPath = 'zeroshot';
@@ -69,7 +98,15 @@ class ClaudeTaskRunner extends TaskRunner {
       jsonSchema && desiredOutputFormat === 'json' && !strictSchema
         ? 'stream-json'
         : desiredOutputFormat;
-    const args = ['task', 'run', '--output-format', runOutputFormat];
+    const args = ['task', 'run', '--output-format', runOutputFormat, '--provider', providerName];
+
+    if (resolvedModelSpec?.model) {
+      args.push('--model', resolvedModelSpec.model);
+    }
+
+    if (resolvedModelSpec?.reasoningEffort) {
+      args.push('--reasoning-effort', resolvedModelSpec.reasoningEffort);
+    }
 
     // Pass schema to CLI only when using json output (strictSchema=true or no conflict)
     if (jsonSchema && runOutputFormat === 'json') {
@@ -79,7 +116,14 @@ class ClaudeTaskRunner extends TaskRunner {
     args.push(context);
 
     // Spawn and get task ID
-    const taskId = await this._spawnAndGetTaskId(ctPath, args, cwd, model, agentId);
+    const spawnEnv = {
+      ...process.env,
+    };
+    if (providerName === 'anthropic' && resolvedModelSpec?.model) {
+      spawnEnv.ANTHROPIC_MODEL = resolvedModelSpec.model;
+    }
+
+    const taskId = await this._spawnAndGetTaskId(ctPath, args, cwd, spawnEnv, agentId);
 
     this._log(`📋 [${agentId}]: Following zeroshot logs for ${taskId}`);
 
@@ -94,19 +138,16 @@ class ClaudeTaskRunner extends TaskRunner {
    * @param {string} ctPath
    * @param {string[]} args
    * @param {string} cwd
-   * @param {string} model
+   * @param {Object} spawnEnv
    * @param {string} _agentId
    * @returns {Promise<string>}
    */
-  _spawnAndGetTaskId(ctPath, args, cwd, model, _agentId) {
+  _spawnAndGetTaskId(ctPath, args, cwd, spawnEnv, _agentId) {
     return new Promise((resolve, reject) => {
       const proc = spawn(ctPath, args, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          ANTHROPIC_MODEL: model,
-        },
+        env: spawnEnv,
       });
 
       let stdout = '';
@@ -367,7 +408,8 @@ class ClaudeTaskRunner extends TaskRunner {
   _runIsolated(context, options) {
     const {
       agentId = 'unknown',
-      model = 'sonnet',
+      provider = 'anthropic',
+      modelSpec = null,
       outputFormat = 'stream-json',
       jsonSchema = null,
       strictSchema = false,
@@ -377,49 +419,54 @@ class ClaudeTaskRunner extends TaskRunner {
 
     this._log(`📦 [${agentId}]: Running task in isolated container...`);
 
-    // Determine output format: stream-json for live logs unless strictSchema=true
     const desiredOutputFormat = outputFormat;
     const runOutputFormat =
       jsonSchema && desiredOutputFormat === 'json' && !strictSchema
         ? 'stream-json'
         : desiredOutputFormat;
 
-    // Get configured Claude command (supports custom commands like 'ccr code')
-    const { command: claudeCmd, args: claudeExtraArgs } = getClaudeCommand();
-
     const command = [
-      claudeCmd,
-      ...claudeExtraArgs,
-      '--print',
-      '--input-format',
-      'text',
-      '--dangerously-skip-permissions',
+      'zeroshot',
+      'task',
+      'run',
       '--output-format',
       runOutputFormat,
+      '--provider',
+      provider,
     ];
 
-    if (runOutputFormat === 'stream-json') {
-      command.push('--verbose');
-      command.push('--include-partial-messages');
+    if (modelSpec?.model) {
+      command.push('--model', modelSpec.model);
     }
 
-    // Pass schema to CLI only when using json output (strictSchema=true or no conflict)
+    if (modelSpec?.reasoningEffort) {
+      command.push('--reasoning-effort', modelSpec.reasoningEffort);
+    }
+
     if (jsonSchema && runOutputFormat === 'json') {
       command.push('--json-schema', JSON.stringify(jsonSchema));
     }
 
-    if (model) {
-      command.push('--model', model);
+    let finalContext = context;
+    if (jsonSchema && desiredOutputFormat === 'json' && runOutputFormat === 'stream-json') {
+      finalContext += `\n\n## Output Format (REQUIRED)\n\nReturn a JSON object that matches this schema exactly.\n\nSchema:\n\`\`\`json\n${JSON.stringify(
+        jsonSchema,
+        null,
+        2
+      )}\n\`\`\`\n`;
     }
 
-    command.push(context);
+    command.push(finalContext);
 
     return new Promise((resolve, reject) => {
       let output = '';
       let resolved = false;
 
       const proc = manager.spawnInContainer(clusterId, command, {
-        env: { ANTHROPIC_MODEL: model },
+        env:
+          provider === 'anthropic' && modelSpec?.model
+            ? { ANTHROPIC_MODEL: modelSpec.model, ZEROSHOT_BLOCK_ASK_USER: '1' }
+            : {},
       });
 
       proc.stdout.on('data', (/** @type {Buffer} */ data) => {

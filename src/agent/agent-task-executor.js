@@ -14,6 +14,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { getProvider, parseChunkWithProvider } = require('../providers');
 
 // Direct API caller for fast conductor classification
 const { callDirectApi, shouldUseDirectApi } = require('./direct-api-caller');
@@ -97,7 +98,9 @@ function extractErrorContext({ output, statusOutput, taskId, isNotFound = false 
   // Fall back to extracting from output (last 500 chars)
   const lastOutput = (output || '').slice(-500).trim();
   if (!lastOutput) {
-    return sanitizeErrorMessage('Task failed with no output (check if task was interrupted or timed out)');
+    return sanitizeErrorMessage(
+      'Task failed with no output (check if task was interrupted or timed out)'
+    );
   }
 
   // Extract non-JSON lines only (JSON lines contain "is_error": true which falsely matches)
@@ -144,36 +147,26 @@ let dangerousGitHookInstalled = false;
  * @param {string} output - Full NDJSON output from Claude CLI
  * @returns {Object|null} Token usage data or null if not found
  */
-function extractTokenUsage(output) {
+function extractTokenUsage(output, providerName = 'anthropic') {
   if (!output) return null;
 
-  const lines = output.split('\n');
+  const provider = getProvider(providerName);
+  const events = parseChunkWithProvider(provider, output);
+  const resultEvent = events.find((event) => event.type === 'result');
 
-  // Find the result line containing usage data
-  for (const line of lines) {
-    const content = stripTimestampPrefix(line);
-    if (!content) continue;
-
-    try {
-      const event = JSON.parse(content);
-      if (event.type === 'result') {
-        const usage = event.usage || {};
-        return {
-          inputTokens: usage.input_tokens || 0,
-          outputTokens: usage.output_tokens || 0,
-          cacheReadInputTokens: usage.cache_read_input_tokens || 0,
-          cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
-          totalCostUsd: event.total_cost_usd || null,
-          durationMs: event.duration_ms || null,
-          modelUsage: event.modelUsage || null,
-        };
-      }
-    } catch {
-      // Not valid JSON, continue
-    }
+  if (!resultEvent) {
+    return null;
   }
 
-  return null;
+  return {
+    inputTokens: resultEvent.inputTokens || 0,
+    outputTokens: resultEvent.outputTokens || 0,
+    cacheReadInputTokens: resultEvent.cacheReadInputTokens || 0,
+    cacheCreationInputTokens: resultEvent.cacheCreationInputTokens || 0,
+    totalCostUsd: resultEvent.cost || null,
+    durationMs: resultEvent.duration || null,
+    modelUsage: resultEvent.modelUsage || null,
+  };
 }
 
 /**
@@ -339,9 +332,14 @@ function ensureDangerousGitHook() {
  * @returns {Promise<Object>} Result object { success, output, error }
  */
 async function spawnClaudeTask(agent, context) {
+  const providerName = agent._resolveProvider ? agent._resolveProvider() : 'anthropic';
+  const modelSpec = agent._resolveModelSpec
+    ? agent._resolveModelSpec()
+    : { model: agent._selectModel() };
+
   // FAST PATH: Direct API for conductor classification
   // Bypasses Claude CLI overhead (~27s → ~1s) for simple classification tasks
-  if (shouldUseDirectApi(agent.config)) {
+  if (providerName === 'anthropic' && shouldUseDirectApi(agent.config)) {
     return spawnClaudeTaskDirectApi(agent, context);
   }
 
@@ -358,7 +356,15 @@ async function spawnClaudeTask(agent, context) {
     agent.config.jsonSchema && desiredOutputFormat === 'json' && !strictSchema
       ? 'stream-json'
       : desiredOutputFormat;
-  const args = ['task', 'run', '--output-format', runOutputFormat];
+  const args = ['task', 'run', '--output-format', runOutputFormat, '--provider', providerName];
+
+  if (modelSpec?.model) {
+    args.push('--model', modelSpec.model);
+  }
+
+  if (modelSpec?.reasoningEffort) {
+    args.push('--reasoning-effort', modelSpec.reasoningEffort);
+  }
 
   // Add verification mode flag if configured
   if (agent.config.verificationMode) {
@@ -417,30 +423,35 @@ async function spawnClaudeTask(agent, context) {
     return spawnClaudeTaskIsolated(agent, context);
   }
 
-  // NON-ISOLATION MODE: Use user's existing Claude config (preserves Keychain auth)
+  // NON-ISOLATION MODE: For Anthropic, use user's existing Claude config
   // AskUserQuestion blocking handled via:
-  // 1. Prompt injection (see agent-context-builder) - tells agent not to ask
+  // 1. Prompt injection (see agent-context-builder)
   // 2. PreToolUse hook (defense-in-depth) - activated by ZEROSHOT_BLOCK_ASK_USER env var
-  // DO NOT override CLAUDE_CONFIG_DIR - it breaks authentication on Claude CLI 2.x
-  ensureAskUserQuestionHook();
+  if (providerName === 'anthropic') {
+    ensureAskUserQuestionHook();
 
-  // WORKTREE MODE: Install git safety hook (blocks dangerous git commands)
-  if (agent.worktree?.enabled) {
-    ensureDangerousGitHook();
+    // WORKTREE MODE: Install git safety hook (blocks dangerous git commands)
+    if (agent.worktree?.enabled) {
+      ensureDangerousGitHook();
+    }
   }
 
   // Build environment for spawn
   const spawnEnv = {
     ...process.env,
-    ANTHROPIC_MODEL: agent._selectModel(),
-    // Activate AskUserQuestion blocking hook (see hooks/block-ask-user-question.py)
-    ZEROSHOT_BLOCK_ASK_USER: '1',
   };
 
-  // WORKTREE MODE: Activate git safety hook via environment variable
-  // The hook only activates when ZEROSHOT_WORKTREE=1 is set
-  if (agent.worktree?.enabled) {
-    spawnEnv.ZEROSHOT_WORKTREE = '1';
+  if (providerName === 'anthropic') {
+    if (modelSpec?.model) {
+      spawnEnv.ANTHROPIC_MODEL = modelSpec.model;
+    }
+    // Activate AskUserQuestion blocking hook (see hooks/block-ask-user-question.py)
+    spawnEnv.ZEROSHOT_BLOCK_ASK_USER = '1';
+
+    // WORKTREE MODE: Activate git safety hook via environment variable
+    if (agent.worktree?.enabled) {
+      spawnEnv.ZEROSHOT_WORKTREE = '1';
+    }
   }
 
   const taskId = await new Promise((resolve, reject) => {
@@ -672,6 +683,7 @@ function followClaudeTaskLogs(agent, taskId) {
   const fsModule = require('fs');
   const { execSync, exec } = require('child_process');
   const ctPath = getClaudeTasksPath();
+  const providerName = agent._resolveProvider ? agent._resolveProvider() : 'anthropic';
 
   return new Promise((resolve, _reject) => {
     let output = '';
@@ -752,6 +764,7 @@ function followClaudeTaskLogs(agent, taskId) {
             agent: agent.id,
             role: agent.role,
             iteration: agent.iteration,
+            provider: providerName,
           },
         },
       });
@@ -837,7 +850,9 @@ function followClaudeTaskLogs(agent, taskId) {
             console.error(`  Command: ${ctPath} status ${taskId}`);
             console.error(`  Error: ${error.message}`);
             console.error(`  Stderr: ${stderr || 'none'}`);
-            console.error(`  This may indicate zeroshot is not in PATH or task storage is corrupted.`);
+            console.error(
+              `  This may indicate zeroshot is not in PATH or task storage is corrupted.`
+            );
 
             // Stop polling and resolve with failure
             if (!resolved) {
@@ -909,7 +924,7 @@ function followClaudeTaskLogs(agent, taskId) {
               success,
               output,
               error: errorContext,
-              tokenUsage: extractTokenUsage(output),
+              tokenUsage: extractTokenUsage(output, providerName),
             });
           }, 500);
         }
@@ -931,7 +946,7 @@ function followClaudeTaskLogs(agent, taskId) {
           success: false,
           output,
           error: reason,
-          tokenUsage: extractTokenUsage(output),
+          tokenUsage: extractTokenUsage(output, providerName),
         });
       },
     };
@@ -974,6 +989,10 @@ function getClaudeTasksPath() {
  */
 async function spawnClaudeTaskIsolated(agent, context) {
   const { manager, clusterId } = agent.isolation;
+  const providerName = agent._resolveProvider ? agent._resolveProvider() : 'anthropic';
+  const modelSpec = agent._resolveModelSpec
+    ? agent._resolveModelSpec()
+    : { model: agent._selectModel() };
 
   agent._log(`📦 Agent ${agent.id}: Running task in isolated container using zeroshot task run...`);
 
@@ -986,7 +1005,23 @@ async function spawnClaudeTaskIsolated(agent, context) {
       ? 'stream-json'
       : desiredOutputFormat;
 
-  const command = ['zeroshot', 'task', 'run', '--output-format', runOutputFormat];
+  const command = [
+    'zeroshot',
+    'task',
+    'run',
+    '--output-format',
+    runOutputFormat,
+    '--provider',
+    providerName,
+  ];
+
+  if (modelSpec?.model) {
+    command.push('--model', modelSpec.model);
+  }
+
+  if (modelSpec?.reasoningEffort) {
+    command.push('--reasoning-effort', modelSpec.reasoningEffort);
+  }
 
   // Add verification mode flag if configured
   if (agent.config.verificationMode) {
@@ -1025,13 +1060,15 @@ async function spawnClaudeTaskIsolated(agent, context) {
 
   // STEP 1: Spawn task and extract task ID (same as non-isolated mode)
   const taskId = await new Promise((resolve, reject) => {
-    const selectedModel = agent._selectModel();
     const proc = manager.spawnInContainer(clusterId, command, {
-      env: {
-        ANTHROPIC_MODEL: selectedModel,
-        // Activate AskUserQuestion blocking hook (see hooks/block-ask-user-question.py)
-        ZEROSHOT_BLOCK_ASK_USER: '1',
-      },
+      env:
+        providerName === 'anthropic'
+          ? {
+              ANTHROPIC_MODEL: modelSpec?.model,
+              // Activate AskUserQuestion blocking hook (see hooks/block-ask-user-question.py)
+              ZEROSHOT_BLOCK_ASK_USER: '1',
+            }
+          : {},
     });
 
     // Track PID for resource monitoring
@@ -1124,6 +1161,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
 
   const manager = isolation.manager;
   const clusterId = isolation.clusterId;
+  const providerName = agent._resolveProvider ? agent._resolveProvider() : 'anthropic';
 
   return new Promise((resolve, reject) => {
     let taskExited = false;
@@ -1151,9 +1189,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
     // Broadcast line helper (same as non-isolated mode)
     const broadcastLine = (line) => {
       const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
-      const timestamp = timestampMatch
-        ? new Date(timestampMatch[1]).getTime()
-        : Date.now();
+      const timestamp = timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now();
       const content = timestampMatch ? timestampMatch[2] : line;
 
       agent.messageBus.publish({
@@ -1165,6 +1201,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
             line: content,
             taskId,
             iteration: agent.iteration,
+            provider: providerName,
           },
         },
         timestamp,
@@ -1197,9 +1234,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
         if (code !== 0) {
           cleanup();
           return reject(
-            new Error(
-              `Failed to get log path for ${taskId} inside container: ${stderr || stdout}`
-            )
+            new Error(`Failed to get log path for ${taskId} inside container: ${stderr || stdout}`)
           );
         }
 
@@ -1309,7 +1344,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
                 taskId,
                 result: parsedResult,
                 error: errorContext,
-                tokenUsage: extractTokenUsage(fullOutput),
+                tokenUsage: extractTokenUsage(fullOutput, providerName),
               });
             }
           } catch (statusErr) {
@@ -1323,11 +1358,7 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
           setTimeout(() => {
             if (!taskExited) {
               cleanup();
-              reject(
-                new Error(
-                  `Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`
-                )
-              );
+              reject(new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`));
             }
           }, agent.timeout);
         }
@@ -1353,6 +1384,15 @@ function parseResultOutput(agent, output) {
     throw new Error('Task execution failed - no output');
   }
 
+  const providerName = agent._resolveProvider ? agent._resolveProvider() : 'anthropic';
+  const provider = getProvider(providerName);
+  const events = parseChunkWithProvider(provider, output);
+  const textOutput = events
+    .filter((event) => event.type === 'text')
+    .map((event) => event.text)
+    .join('');
+  const fallbackText = textOutput.trim();
+
   let parsed;
   let trimmedOutput = output.trim();
 
@@ -1375,6 +1415,8 @@ function parseResultOutput(agent, output) {
   // CRITICAL: Strip timestamp prefix before assigning to trimmedOutput
   if (resultLine) {
     trimmedOutput = stripTimestampPrefix(resultLine);
+  } else if (fallbackText) {
+    trimmedOutput = fallbackText;
   } else if (lines.length > 1) {
     // Fallback: use last non-empty line (also strip timestamp)
     for (let i = lines.length - 1; i >= 0; i--) {

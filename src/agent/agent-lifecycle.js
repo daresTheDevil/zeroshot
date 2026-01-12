@@ -281,7 +281,7 @@ async function executeTask(agent, triggeringMessage) {
         console.log(`${'='.repeat(80)}\n`);
       }
 
-      // Spawn claude-zeroshots
+      // Spawn provider task
       agent.state = 'executing_task';
 
       // LOCK CONTENTION FIX: Add random jitter for validators to prevent thundering herd
@@ -292,14 +292,19 @@ async function executeTask(agent, triggeringMessage) {
       if (agent.role === 'validator' && !agent.testMode) {
         const jitterMs = Math.floor(Math.random() * 15000); // 0-15 seconds
         if (!agent.quiet) {
-          agent._log(`[Agent ${agent.id}] Adding ${Math.round(jitterMs / 1000)}s jitter to prevent lock contention`);
+          agent._log(
+            `[Agent ${agent.id}] Adding ${Math.round(jitterMs / 1000)}s jitter to prevent lock contention`
+          );
         }
         await new Promise((resolve) => setTimeout(resolve, jitterMs));
       }
 
+      const modelSpec = agent._resolveModelSpec ? agent._resolveModelSpec() : null;
       agent._publishLifecycle('TASK_STARTED', {
         iteration: agent.iteration,
         model: agent._selectModel(),
+        provider: agent._resolveProvider ? agent._resolveProvider() : 'anthropic',
+        modelSpec,
         triggeredBy: triggeringMessage.topic,
         triggerFrom: triggeringMessage.sender,
       });
@@ -381,8 +386,10 @@ async function executeTask(agent, triggeringMessage) {
       if (isLockError) {
         // Lock contention - add significant jittered delay
         const lockDelay = 10000 + Math.floor(Math.random() * 20000); // 10-30 seconds
-        console.error(`⚠️ Lock contention detected - waiting ${Math.round(lockDelay / 1000)}s before retry`);
-        await new Promise(resolve => setTimeout(resolve, lockDelay));
+        console.error(
+          `⚠️ Lock contention detected - waiting ${Math.round(lockDelay / 1000)}s before retry`
+        );
+        await new Promise((resolve) => setTimeout(resolve, lockDelay));
       } else if (attempt < maxRetries) {
         console.error(`Will retry in ${baseDelay * Math.pow(2, attempt - 1)}ms...`);
       }

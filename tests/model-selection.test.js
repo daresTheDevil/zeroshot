@@ -43,22 +43,27 @@ describe('Model Selection', () => {
   });
   describe('Static model (backward compatibility)', () => {
     it('should use static model when no rules provided', () => {
-      const agent = new AgentWrapper({ id: 'test', model: 'opus', timeout: 0 }, mockMessageBus, mockCluster, {
-        testMode: true,
-        mockSpawnFn: () => {},
-      });
+      const agent = new AgentWrapper(
+        { id: 'test', model: 'opus', timeout: 0 },
+        mockMessageBus,
+        mockCluster,
+        {
+          testMode: true,
+          mockSpawnFn: () => {},
+        }
+      );
 
       assert.strictEqual(agent._selectModel(), 'opus');
     });
 
-    it('should default to maxModel if no model specified', () => {
+    it('should default to provider level2 if no model specified', () => {
       const agent = new AgentWrapper({ id: 'test', timeout: 0 }, mockMessageBus, mockCluster, {
         testMode: true,
         mockSpawnFn: () => {},
       });
 
-      // When no model specified, defaults to maxModel (opus in test settings)
-      assert.strictEqual(agent._selectModel(), 'opus');
+      // When no model specified, defaults to provider level2 (sonnet for anthropic)
+      assert.strictEqual(agent._selectModel(), 'sonnet');
     });
   });
 

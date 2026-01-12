@@ -45,7 +45,7 @@ describe('Orchestrator Subscription Race Condition (issue #31)', function () {
       JSON.stringify(
         {
           firstRunComplete: true,
-          defaultModel: 'sonnet',
+          defaultProvider: 'anthropic',
           autoCheckUpdates: false,
         },
         null,

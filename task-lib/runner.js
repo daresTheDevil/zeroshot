@@ -1,62 +1,72 @@
 import { fork } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { LOGS_DIR, DEFAULT_MODEL } from './config.js';
+import { LOGS_DIR } from './config.js';
 import { addTask, generateId, ensureDirs } from './store.js';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { loadSettings } = require('../lib/settings.js');
+const { getProvider } = require('../src/providers');
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export function spawnTask(prompt, options = {}) {
+export async function spawnTask(prompt, options = {}) {
   ensureDirs();
 
   const id = generateId();
   const logFile = join(LOGS_DIR, `${id}.log`);
   const cwd = options.cwd || process.cwd();
-  const model = options.model || process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
 
-  // Build claude command args
-  // --print: non-interactive mode
-  // --input-format: force text input (avoid stream-json command mode)
-  // --dangerously-skip-permissions: background tasks can't prompt for approval (CRITICAL)
-  // --output-format: stream-json (default) for real-time, text for clean output, json for structured
+  const settings = loadSettings();
+  const providerName = options.provider || settings.defaultProvider || 'anthropic';
+  const provider = getProvider(providerName);
+  const providerSettings = settings.providerSettings?.[providerName] || {};
+  const levelOverrides = providerSettings.levelOverrides || {};
+
   const outputFormat = options.outputFormat || 'stream-json';
-  const args = [
-    '--print',
-    '--input-format',
-    'text',
-    '--dangerously-skip-permissions',
-    '--output-format',
-    outputFormat,
-  ];
 
-  // Only add streaming options for stream-json format
-  if (outputFormat === 'stream-json') {
-    args.push('--verbose');
-    // Include partial messages to get streaming updates before completion (required for stream-json format)
-    args.push('--include-partial-messages');
+  let jsonSchema = options.jsonSchema || null;
+  if (jsonSchema && outputFormat !== 'json') {
+    console.warn('Warning: --json-schema requires --output-format json, ignoring schema');
+    jsonSchema = null;
   }
 
-  // Add JSON schema if provided (only works with --output-format json)
-  if (options.jsonSchema) {
-    if (outputFormat !== 'json') {
-      console.warn('Warning: --json-schema requires --output-format json, ignoring schema');
-    } else {
-      // CRITICAL: Must stringify schema object before passing to CLI (like zeroshot does)
-      const schemaString =
-        typeof options.jsonSchema === 'string'
-          ? options.jsonSchema
-          : JSON.stringify(options.jsonSchema);
-      args.push('--json-schema', schemaString);
+  let modelSpec;
+  if (options.model) {
+    modelSpec = {
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+    };
+  } else {
+    const level = options.modelLevel || providerSettings.defaultLevel || provider.getDefaultLevel();
+    modelSpec = provider.resolveModelSpec(level, levelOverrides);
+    if (options.reasoningEffort) {
+      modelSpec = { ...modelSpec, reasoningEffort: options.reasoningEffort };
     }
   }
 
-  if (options.resume) {
-    args.push('--resume', options.resume);
-  } else if (options.continue) {
-    args.push('--continue');
-  }
+  const cliFeatures = await provider.getCliFeatures();
+  const commandSpec = provider.buildCommand(prompt, {
+    modelSpec,
+    outputFormat,
+    jsonSchema,
+    cwd,
+    autoApprove: true,
+    cliFeatures,
+  });
 
-  args.push(prompt);
+  const finalArgs = [...commandSpec.args];
+  if (providerName === 'anthropic') {
+    const promptIndex = finalArgs.length - 1;
+    if (options.resume) {
+      finalArgs.splice(promptIndex, 0, '--resume', options.resume);
+    } else if (options.continue) {
+      finalArgs.splice(promptIndex, 0, '--continue');
+    }
+  } else if (options.resume || options.continue) {
+    console.warn('Warning: resume/continue is only supported for Claude CLI; ignoring.');
+  }
 
   const task = {
     id,
@@ -71,6 +81,8 @@ export function spawnTask(prompt, options = {}) {
     updatedAt: new Date().toISOString(),
     exitCode: null,
     error: null,
+    provider: providerName,
+    model: modelSpec?.model || null,
     // Schedule reference (if spawned by scheduler)
     scheduleId: options.scheduleId || null,
     // Attach support
@@ -80,26 +92,23 @@ export function spawnTask(prompt, options = {}) {
 
   addTask(task);
 
-  // Fork a watcher process that will manage the claude process
   const watcherConfig = {
     outputFormat,
-    jsonSchema: options.jsonSchema || null,
+    jsonSchema,
     silentJsonOutput: options.silentJsonOutput || false,
-    model,
+    provider: providerName,
+    command: commandSpec.binary,
+    env: commandSpec.env || {},
   };
 
-  // Use attachable watcher by default (unless explicitly disabled).
-  // JSON schema tasks disable PTY to avoid Claude CLI streaming-mode errors on
-  // background task notifications (PTY triggers the problematic command queue).
-  const useAttachable =
-    options.attachable !== false && !options.jsonSchema;
+  const useAttachable = options.attachable !== false && !options.jsonSchema;
   const watcherScript = useAttachable
     ? join(__dirname, 'attachable-watcher.js')
     : join(__dirname, 'watcher.js');
 
   const watcher = fork(
     watcherScript,
-    [id, cwd, logFile, JSON.stringify(args), JSON.stringify(watcherConfig)],
+    [id, cwd, logFile, JSON.stringify(finalArgs), JSON.stringify(watcherConfig)],
     {
       detached: true,
       stdio: 'ignore',
@@ -108,7 +117,6 @@ export function spawnTask(prompt, options = {}) {
 
   watcher.unref();
 
-  // Return task immediately - watcher will update PID async
   return task;
 }
 

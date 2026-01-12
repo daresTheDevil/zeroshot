@@ -28,6 +28,10 @@ Destructive commands (need permission): `zeroshot kill`, `zeroshot clear`, `zero
 | Ledger (SQLite)          | `src/ledger.js`                     |
 | Trigger evaluation       | `src/logic-engine.js`               |
 | Agent wrapper            | `src/agent-wrapper.js`              |
+| Providers registry       | `src/providers/index.js`            |
+| Provider implementations | `src/providers/`                    |
+| Provider detection       | `lib/provider-detection.js`         |
+| Provider capabilities    | `src/providers/capabilities.js`     |
 | TUI dashboard            | `src/tui/`                          |
 | Docker mounts/env        | `lib/docker-config.js`              |
 | Container lifecycle      | `src/isolation-manager.js`          |
@@ -57,6 +61,7 @@ zeroshot watch                    # TUI dashboard
 zeroshot export <id>              # Export conversation
 zeroshot agents list              # Available agents
 zeroshot settings                 # View/modify settings
+zeroshot providers                # Provider status and defaults
 ```
 
 UX modes:
@@ -65,7 +70,7 @@ UX modes:
 - Daemon (`-d`): background, Ctrl+C detaches.
 - Attach (`zeroshot attach`): connect to daemon, Ctrl+C detaches only.
 
-Settings: `maxModel` (opus/sonnet/haiku cost ceiling), `defaultConfig`, `logLevel`.
+Settings: `defaultProvider`, `providerSettings` (levels/overrides), legacy `maxModel`, `defaultConfig`, `logLevel`.
 
 ## Architecture
 
@@ -90,7 +95,7 @@ Agent A -> publish() -> SQLite Ledger -> LogicEngine -> trigger match -> Agent B
 {
   "id": "worker",
   "role": "implementation",
-  "model": "sonnet",
+  "modelLevel": "level2",
   "triggers": [{ "topic": "ISSUE_OPENED", "action": "execute_task" }],
   "prompt": "Implement the requested feature...",
   "hooks": {
@@ -101,6 +106,13 @@ Agent A -> publish() -> SQLite Ledger -> LogicEngine -> trigger match -> Agent B
   }
 }
 ```
+
+### Provider Model Levels
+
+- Use `modelLevel` (`level1`/`level2`/`level3`) for provider-agnostic configs.
+- Set `provider` per agent or `defaultProvider`/`forceProvider` at cluster level.
+- `model` remains a provider-specific escape hatch.
+- OpenAI-only: `reasoningEffort` (`low|medium|high|xhigh`).
 
 ### Logic Script API
 
@@ -158,7 +170,9 @@ Configurable credential mounts for `--docker` mode. See `lib/docker-config.js`.
 | `dockerEnvPassthrough` | `string[]`    | `[]`     | Extra env vars (supports `VAR`, `VAR_*`, `VAR=value`) |
 | `dockerContainerHome`  | `string`      | `/root`  | Container home for `$HOME` expansion                  |
 
-Mount presets: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`.
+Mount presets: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`, `claude`, `codex`, `gemini`.
+
+Provider CLIs in Docker require credential mounts; Zeroshot warns when missing.
 
 Env var syntax:
 

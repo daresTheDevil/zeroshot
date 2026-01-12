@@ -1,7 +1,7 @@
 {
   "name": "@covibes/zeroshot",
   "version": "5.2.1",
-  "description": "Multi-agent orchestration engine for Claude - cluster coordinator and CLI",
+  "description": "Multi-agent orchestration engine for Claude, Codex, and Gemini",
   "main": "src/orchestrator.js",
   "bin": {
     "zeroshot": "./cli/index.js"
@@ -55,6 +55,8 @@
     "multi-agent",
     "orchestration",
     "claude",
+    "codex",
+    "gemini",
     "automation"
   ],
   "author": "Covibes",

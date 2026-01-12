@@ -108,7 +108,7 @@ function log(msg) {
 /**
  * Check and run due schedules
  */
-function checkSchedules() {
+async function checkSchedules() {
   const schedules = loadSchedules();
   const now = new Date();
 
@@ -122,7 +122,7 @@ function checkSchedules() {
     log(`Running scheduled task: ${schedule.id} - "${schedule.prompt.slice(0, 50)}..."`);
 
     try {
-      const task = spawnTask(schedule.prompt, {
+      const task = await spawnTask(schedule.prompt, {
         cwd: schedule.cwd,
         scheduleId: schedule.id,
       });

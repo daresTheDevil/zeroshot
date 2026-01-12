@@ -2,7 +2,7 @@
  * Integration tests for Orchestrator + Worktree mode
  *
  * Verifies the REAL worktree mode flow:
- * - Git worktree created at /tmp/zeroshot-worktrees/{clusterId}
+ * - Git worktree created at {os.tmpdir()}/zeroshot-worktrees/{clusterId}
  * - Branch zeroshot/{clusterId} created
  * - Agent runs with cwd set to worktree path
  * - Changes isolated from main repo
@@ -106,10 +106,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
     it('should create worktree at expected path', async function () {
       mockRunner.when('worker').returns('{"done": true}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test task' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test task' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       const cluster = orchestrator.getCluster(result.id);
 
@@ -125,9 +129,11 @@ describe('Orchestrator Worktree Mode Integration', function () {
       );
 
       // VERIFY: Path is in expected location
+      const expectedRoot = fs.realpathSync(path.join(os.tmpdir(), 'zeroshot-worktrees'));
+      const worktreePath = fs.realpathSync(cluster.worktree.path);
       assert(
-        cluster.worktree.path.includes('/tmp/zeroshot-worktrees/'),
-        'Worktree should be in /tmp/zeroshot-worktrees/'
+        worktreePath.startsWith(expectedRoot + path.sep),
+        `Worktree should be in ${expectedRoot}${path.sep}`
       );
 
       await orchestrator.stop(result.id);
@@ -136,10 +142,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
     it('should create branch with zeroshot/ prefix', async function () {
       mockRunner.when('worker').returns('{"done": true}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test task' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test task' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       const cluster = orchestrator.getCluster(result.id);
 
@@ -152,7 +162,7 @@ describe('Orchestrator Worktree Mode Integration', function () {
       // VERIFY: Branch exists in main repo
       const branches = execSync('git branch --list', {
         cwd: testRepoDir,
-        encoding: 'utf8'
+        encoding: 'utf8',
       });
       assert(
         branches.includes(cluster.worktree.branch),
@@ -165,10 +175,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
     it('should isolate changes from main repo', async function () {
       mockRunner.when('worker').returns('{"done": true}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test task' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test task' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       const cluster = orchestrator.getCluster(result.id);
       const worktreePath = cluster.worktree.path;
@@ -190,10 +204,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
     it('should clean up worktree on kill but preserve branch', async function () {
       mockRunner.when('worker').returns('{"done": true}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test task' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test task' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       const cluster = orchestrator.getCluster(result.id);
       const worktreePath = cluster.worktree.path;
@@ -210,7 +228,7 @@ describe('Orchestrator Worktree Mode Integration', function () {
       // VERIFY: Branch PRESERVED (needed for PR creation)
       const branches = execSync('git branch --list', {
         cwd: testRepoDir,
-        encoding: 'utf8'
+        encoding: 'utf8',
       });
       assert(
         branches.includes(branchName),
@@ -223,10 +241,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
     it('should execute agent with cwd set to worktree', async function () {
       mockRunner.when('worker').returns('{"summary": "Implemented feature"}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test task' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test task' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       await waitForClusterState(orchestrator, result.id, 'stopped', 30000);
 
@@ -235,19 +257,20 @@ describe('Orchestrator Worktree Mode Integration', function () {
 
       // VERIFY: Task was executed (context received)
       const calls = mockRunner.getCalls('worker');
-      assert(
-        calls[0].context.includes('Test task'),
-        'Context should include task text'
-      );
+      assert(calls[0].context.includes('Test task'), 'Context should include task text');
     });
 
     it('should publish messages to ledger correctly', async function () {
       mockRunner.when('worker').returns('{"done": true}');
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Test message flow' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Test message flow' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       await waitForClusterState(orchestrator, result.id, 'stopped', 30000);
 
@@ -275,18 +298,19 @@ describe('Orchestrator Worktree Mode Integration', function () {
 
       const startTime = Date.now();
 
-      const result = await orchestrator.start(simpleConfig, { text: 'Performance test' }, {
-        worktree: true,
-        cwd: testRepoDir,
-      });
+      const result = await orchestrator.start(
+        simpleConfig,
+        { text: 'Performance test' },
+        {
+          worktree: true,
+          cwd: testRepoDir,
+        }
+      );
 
       const startupTime = Date.now() - startTime;
 
       // Worktree should start in under 5 seconds (Docker typically takes 30-60s)
-      assert(
-        startupTime < 5000,
-        `Worktree startup should be <5s, took ${startupTime}ms`
-      );
+      assert(startupTime < 5000, `Worktree startup should be <5s, took ${startupTime}ms`);
 
       await orchestrator.stop(result.id);
     });
@@ -299,10 +323,14 @@ describe('Orchestrator Worktree Mode Integration', function () {
       mockRunner.when('worker').returns('{"done": true}');
 
       try {
-        await orchestrator.start(simpleConfig, { text: 'Should fail' }, {
-          worktree: true,
-          cwd: nonGitDir,
-        });
+        await orchestrator.start(
+          simpleConfig,
+          { text: 'Should fail' },
+          {
+            worktree: true,
+            cwd: nonGitDir,
+          }
+        );
         assert.fail('Should throw for non-git directory');
       } catch (err) {
         assert(
@@ -338,6 +366,6 @@ async function waitForClusterState(orchestrator, clusterId, targetState, timeout
   const cluster = orchestrator.getCluster(clusterId);
   throw new Error(
     `Timeout waiting for cluster ${clusterId} to reach state '${targetState}'. ` +
-    `Current state: ${cluster?.state}`
+      `Current state: ${cluster?.state}`
   );
 }

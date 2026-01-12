@@ -27,7 +27,7 @@ export function listTasks(options = {}) {
   // Table format (default) or verbose format
   if (options.verbose) {
     // Verbose format (old behavior)
-    console.log(chalk.bold(`\nClaude Tasks (${filtered.length}/${taskList.length})\n`));
+    console.log(chalk.bold(`\nTasks (${filtered.length}/${taskList.length})\n`));
 
     for (const task of filtered) {
       // Verify running status

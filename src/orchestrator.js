@@ -22,6 +22,7 @@ const IsolationManager = require('./isolation-manager');
 const { generateName } = require('./name-generator');
 const configValidator = require('./config-validator');
 const TemplateResolver = require('./template-resolver');
+const { loadSettings } = require('../lib/settings');
 
 function applyModelOverride(agentConfig, modelOverride) {
   if (!modelOverride) return;
@@ -612,6 +613,11 @@ class Orchestrator {
       // Create container with workspace mounted
       // CRITICAL: Use options.cwd (git repo root) instead of process.cwd()
       const workDir = options.cwd || process.cwd();
+      const providerName =
+        config.forceProvider ||
+        config.defaultProvider ||
+        loadSettings().defaultProvider ||
+        'anthropic';
       containerId = await isolationManager.createContainer(clusterId, {
         workDir,
         image,
@@ -619,6 +625,7 @@ class Orchestrator {
         noMounts: options.noMounts,
         mounts: options.mounts,
         containerHome: options.containerHome,
+        provider: providerName,
       });
       this._log(`[Orchestrator] Container created: ${containerId} (workDir: ${workDir})`);
     } else if (options.worktree) {
@@ -1293,10 +1300,16 @@ class Orchestrator {
           );
         }
 
+        const providerName =
+          cluster.config?.forceProvider ||
+          cluster.config?.defaultProvider ||
+          loadSettings().defaultProvider ||
+          'anthropic';
         const newContainerId = await cluster.isolation.manager.createContainer(clusterId, {
           workDir, // Use saved workDir, NOT process.cwd()
           image: cluster.isolation.image,
           reuseExistingWorkspace: true, // CRITICAL: Don't wipe existing work
+          provider: providerName,
         });
 
         this._log(`[Orchestrator] New container created: ${newContainerId}`);
@@ -2203,7 +2216,7 @@ return true;`,
    * @private
    */
   _exportMarkdown(cluster, clusterId, messages) {
-    const { parseChunk } = require('../lib/stream-json-parser');
+    const { parseProviderChunk } = require('./providers');
 
     // Find task info
     const issueOpened = messages.find((m) => m.topic === 'ISSUE_OPENED');
@@ -2249,7 +2262,8 @@ return true;`,
         const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
         if (!content) continue;
 
-        const events = parseChunk(content);
+        const provider = msg.content?.data?.provider || msg.sender_provider || 'anthropic';
+        const events = parseProviderChunk(provider, content);
         for (const event of events) {
           switch (event.type) {
             case 'text':

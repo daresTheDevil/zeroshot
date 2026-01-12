@@ -7,7 +7,7 @@
  * Key behaviors tested:
  * - Static model exceeds ceiling → ERROR at agent spawn
  * - Dynamic modelRules exceed ceiling → ERROR at config validation
- * - Unspecified model defaults to maxModel
+ * - Unspecified model defaults to provider default level (bounded by maxModel)
  * - Models within ceiling are allowed
  */
 
@@ -225,7 +225,7 @@ describe('maxModel Ceiling Enforcement', function () {
   });
 
   describe('Default model when unspecified', function () {
-    it('should use maxModel as default when agent has no model specified', function () {
+    it('should use maxModel ceiling when it constrains default', function () {
       saveTestSettings({ maxModel: 'haiku' });
 
       const agentConfig = { id: 'default-model-agent', timeout: 0 };
@@ -245,7 +245,7 @@ describe('maxModel Ceiling Enforcement', function () {
       assert.strictEqual(agent._selectModel(), 'haiku');
     });
 
-    it('should use maxModel=sonnet as default when unspecified in settings', function () {
+    it('should use provider default level when unspecified in settings', function () {
       // Don't save any settings - use defaults
       if (fs.existsSync(TEST_SETTINGS_FILE)) {
         fs.unlinkSync(TEST_SETTINGS_FILE);
@@ -258,11 +258,11 @@ describe('maxModel Ceiling Enforcement', function () {
         mockSpawnFn: () => {},
       });
 
-      // Default maxModel is opus (no restriction by default)
-      assert.strictEqual(agent._selectModel(), 'opus');
+      // Default provider level is level2 (sonnet for anthropic)
+      assert.strictEqual(agent._selectModel(), 'sonnet');
     });
 
-    it('should use maxModel=opus as default when configured', function () {
+    it('should use provider default level even when maxModel allows higher', function () {
       saveTestSettings({ maxModel: 'opus' });
 
       const agentConfig = { id: 'premium-default-agent', timeout: 0 };
@@ -272,7 +272,7 @@ describe('maxModel Ceiling Enforcement', function () {
         mockSpawnFn: () => {},
       });
 
-      assert.strictEqual(agent._selectModel(), 'opus');
+      assert.strictEqual(agent._selectModel(), 'sonnet');
     });
   });
 
@@ -382,10 +382,7 @@ describe('maxModel Ceiling Enforcement', function () {
       delete require.cache[require.resolve('../lib/settings')];
 
       // The agent's _selectModel calls loadSettings each time, so it should now fail
-      assert.throws(
-        () => agent._selectModel(),
-        /Agent requests "sonnet" but maxModel is "haiku"/
-      );
+      assert.throws(() => agent._selectModel(), /Agent requests "sonnet" but maxModel is "haiku"/);
     });
   });
 

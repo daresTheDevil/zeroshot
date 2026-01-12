@@ -9,7 +9,9 @@
  * - maxModel ceiling enforcement at config time
  */
 
-const { loadSettings, validateModelAgainstMax } = require('../../lib/settings');
+const { loadSettings, validateModelAgainstMax, VALID_MODELS } = require('../../lib/settings');
+
+const VALID_LEVELS = ['level1', 'level2', 'level3'];
 
 // Default max iterations (high limit - let the user decide when to give up)
 const DEFAULT_MAX_ITERATIONS = 100;
@@ -58,12 +60,16 @@ function validateAgentConfig(config, options = {}) {
   }
 
   // Model configuration: support both static model and dynamic rules
-  // If no model specified, model is null - _selectModel() will use maxModel as default
+  // If no model specified, model is null - _selectModel() will use provider defaults
   let modelConfig;
   if (config.modelRules) {
     modelConfig = { type: 'rules', rules: config.modelRules };
   } else {
-    modelConfig = { type: 'static', model: config.model || null };
+    modelConfig = {
+      type: 'static',
+      model: config.model || null,
+      modelLevel: config.modelLevel || null,
+    };
   }
 
   // COST CEILING/FLOOR ENFORCEMENT: Validate model(s) against maxModel and minModel at config time
@@ -72,17 +78,26 @@ function validateAgentConfig(config, options = {}) {
   const maxModel = settings.maxModel || 'sonnet';
   const minModel = settings.minModel || null;
 
-  if (modelConfig.type === 'static' && modelConfig.model) {
-    // Static model: validate once
-    try {
-      validateModelAgainstMax(modelConfig.model, maxModel, minModel);
-    } catch (error) {
-      throw new Error(`Agent "${config.id}": ${error.message}`);
+  if (modelConfig.type === 'static') {
+    if (modelConfig.model && VALID_MODELS.includes(modelConfig.model)) {
+      // Static model: validate once (legacy Anthropic models only)
+      try {
+        validateModelAgainstMax(modelConfig.model, maxModel, minModel);
+      } catch (error) {
+        throw new Error(`Agent "${config.id}": ${error.message}`);
+      }
+    }
+
+    if (modelConfig.modelLevel && !VALID_LEVELS.includes(modelConfig.modelLevel)) {
+      throw new Error(
+        `Agent "${config.id}": invalid modelLevel "${modelConfig.modelLevel}". ` +
+          `Valid: ${VALID_LEVELS.join(', ')}`
+      );
     }
   } else if (modelConfig.type === 'rules') {
     // Dynamic rules: validate ALL rules upfront (don't wait until iteration N)
     for (const rule of modelConfig.rules) {
-      if (rule.model) {
+      if (rule.model && VALID_MODELS.includes(rule.model)) {
         try {
           validateModelAgainstMax(rule.model, maxModel, minModel);
         } catch {
@@ -92,6 +107,13 @@ function validateAgentConfig(config, options = {}) {
               `Either adjust the rule's model or change maxModel/minModel settings.`
           );
         }
+      }
+
+      if (rule.modelLevel && !VALID_LEVELS.includes(rule.modelLevel)) {
+        throw new Error(
+          `Agent "${config.id}": modelRule "${rule.iterations}" has invalid modelLevel ` +
+            `"${rule.modelLevel}". Valid: ${VALID_LEVELS.join(', ')}`
+        );
       }
     }
   }

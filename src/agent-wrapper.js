@@ -13,6 +13,7 @@
 const LogicEngine = require('./logic-engine');
 const { validateAgentConfig } = require('./agent/agent-config');
 const { loadSettings, validateModelAgainstMax } = require('../lib/settings');
+const { getProvider } = require('./providers');
 const { buildContext } = require('./agent/agent-context-builder');
 const { findMatchingTrigger, evaluateTrigger } = require('./agent/agent-trigger-evaluator');
 const { executeHook } = require('./agent/agent-hook-executor');
@@ -87,9 +88,12 @@ class AgentWrapper {
       // TaskRunner DI - create mockSpawnFn wrapper
       const taskRunner = options.taskRunner;
       this.mockSpawnFn = (args, { context }) => {
+        const spec = this._resolveModelSpec();
         return taskRunner.run(context, {
           agentId: this.id,
           model: this._selectModel(),
+          modelSpec: spec,
+          provider: this._resolveProvider(),
         });
       };
     } else {
@@ -116,6 +120,89 @@ class AgentWrapper {
     }
   }
 
+  _resolveProvider() {
+    const settings = loadSettings();
+    const clusterConfig = this.cluster?.config || {};
+
+    return (
+      clusterConfig.forceProvider ||
+      this.config.provider ||
+      clusterConfig.defaultProvider ||
+      settings.defaultProvider ||
+      'anthropic'
+    );
+  }
+
+  _resolveModelSpec() {
+    const settings = loadSettings();
+    const providerName = this._resolveProvider();
+    const provider = getProvider(providerName);
+    const clusterConfig = this.cluster?.config || {};
+    const providerSettings = settings.providerSettings?.[providerName] || {};
+    const levelOverrides = providerSettings.levelOverrides || {};
+    const minLevel = providerSettings.minLevel;
+    const maxLevel = providerSettings.maxLevel;
+    const forcedLevel =
+      clusterConfig.forceProvider === providerName ? clusterConfig.forceLevel : null;
+
+    const applyReasoningOverride = (spec, override) => {
+      if (!override) return spec;
+      return { ...spec, reasoningEffort: override };
+    };
+
+    if (this.modelConfig.type === 'rules') {
+      for (const rule of this.modelConfig.rules) {
+        if (this._matchesIterationRange(rule.iterations)) {
+          if (rule.model) {
+            return {
+              level: 'custom',
+              model: rule.model,
+              reasoningEffort: rule.reasoningEffort || this.config.reasoningEffort,
+            };
+          }
+          if (rule.modelLevel) {
+            const level = provider.validateLevel(rule.modelLevel, minLevel, maxLevel);
+            const spec = provider.resolveModelSpec(level, levelOverrides);
+            return applyReasoningOverride(
+              { ...spec, level },
+              rule.reasoningEffort || this.config.reasoningEffort
+            );
+          }
+        }
+      }
+
+      throw new Error(
+        `Agent ${this.id}: No model rule matched iteration ${this.iteration}. ` +
+          `Add a catch-all rule like { "iterations": "all", "modelLevel": "level2" }`
+      );
+    }
+
+    if (this.modelConfig.model) {
+      return {
+        level: 'custom',
+        model: this.modelConfig.model,
+        reasoningEffort: this.config.reasoningEffort,
+      };
+    }
+
+    if (forcedLevel) {
+      const level = provider.validateLevel(forcedLevel, minLevel, maxLevel);
+      const spec = provider.resolveModelSpec(level, levelOverrides);
+      return applyReasoningOverride({ ...spec, level }, this.config.reasoningEffort);
+    }
+
+    if (this.modelConfig.modelLevel) {
+      const level = provider.validateLevel(this.modelConfig.modelLevel, minLevel, maxLevel);
+      const spec = provider.resolveModelSpec(level, levelOverrides);
+      return applyReasoningOverride({ ...spec, level }, this.config.reasoningEffort);
+    }
+
+    const defaultLevel = providerSettings.defaultLevel || provider.getDefaultLevel();
+    const level = provider.validateLevel(defaultLevel, minLevel, maxLevel);
+    const spec = provider.resolveModelSpec(level, levelOverrides);
+    return applyReasoningOverride({ ...spec, level }, this.config.reasoningEffort);
+  }
+
   /**
    * Publish a message to the message bus, always including sender_model
    * @private
@@ -126,6 +213,7 @@ class AgentWrapper {
       cluster_id: this.cluster.id,
       sender: this.id,
       sender_model: this._selectModel(),
+      sender_provider: this._resolveProvider(),
     });
   }
 
@@ -145,6 +233,7 @@ class AgentWrapper {
           role: this.role,
           state: this.state,
           model: this._selectModel(),
+          provider: this._resolveProvider(),
           ...details,
         },
       },
@@ -153,45 +242,21 @@ class AgentWrapper {
 
   /**
    * Select model based on current iteration and agent config
-   * Enforces maxModel ceiling from settings
-   * @returns {string} Model name ('sonnet', 'opus', 'haiku')
+   * Enforces legacy maxModel/minModel for Anthropics' haiku/sonnet/opus
+   * @returns {string|null}
    * @private
    */
   _selectModel() {
+    const spec = this._resolveModelSpec();
     const settings = loadSettings();
     const maxModel = settings.maxModel || 'sonnet';
     const minModel = settings.minModel || null;
 
-    let requestedModel = null;
-
-    // Get requested model from config
-    if (this.modelConfig.type === 'static') {
-      requestedModel = this.modelConfig.model;
-    } else if (this.modelConfig.type === 'rules') {
-      // Dynamic rules: evaluate based on iteration
-      for (const rule of this.modelConfig.rules) {
-        if (this._matchesIterationRange(rule.iterations)) {
-          requestedModel = rule.model;
-          break;
-        }
-      }
-
-      // No match for rules: fail fast (config error)
-      if (!requestedModel) {
-        throw new Error(
-          `Agent ${this.id}: No model rule matched iteration ${this.iteration}. ` +
-            `Add a catch-all rule like { "iterations": "all", "model": "sonnet" }`
-        );
-      }
+    if (spec.model && ['opus', 'sonnet', 'haiku'].includes(spec.model)) {
+      return validateModelAgainstMax(spec.model, maxModel, minModel);
     }
 
-    // If no model specified (neither static nor rules), use maxModel as default
-    if (!requestedModel) {
-      return maxModel;
-    }
-
-    // Enforce ceiling and floor - will throw if requestedModel > maxModel or < minModel
-    return validateModelAgainstMax(requestedModel, maxModel, minModel);
+    return spec.model || null;
   }
 
   /**
@@ -465,10 +530,13 @@ class AgentWrapper {
    * Get current agent state
    */
   getState() {
+    const modelSpec = this._resolveModelSpec();
     return {
       id: this.id,
       role: this.role,
       model: this._selectModel(),
+      provider: this._resolveProvider(),
+      modelSpec,
       state: this.state,
       iteration: this.iteration,
       maxIterations: this.maxIterations,

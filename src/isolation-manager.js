@@ -3,7 +3,7 @@
  *
  * Handles:
  * - Container creation with workspace mounts
- * - Credential injection for Claude CLI
+ * - Credential injection for provider CLIs
  * - Command execution inside containers
  * - Container cleanup on stop/kill
  */
@@ -15,6 +15,7 @@ const os = require('os');
 const fs = require('fs');
 const { loadSettings } = require('../lib/settings');
 const { resolveMounts, resolveEnvs, expandEnvPatterns } = require('../lib/docker-config');
+const { getProvider } = require('./providers');
 
 /**
  * Escape a string for safe use in shell commands
@@ -26,6 +27,19 @@ function escapeShell(str) {
   // Replace single quotes with escaped version and wrap in single quotes
   // This is the safest approach for shell escaping
   return `'${str.replace(/'/g, "'\\''")}'`;
+}
+
+function expandHomePath(value) {
+  if (!value) return value;
+  if (value === '~') return os.homedir();
+  return value.replace(/^~(?=\/|$)/, os.homedir());
+}
+
+function pathContains(base, target) {
+  const resolvedBase = path.resolve(base);
+  const resolvedTarget = path.resolve(target);
+  if (resolvedBase === resolvedTarget) return true;
+  return resolvedTarget.startsWith(resolvedBase + path.sep);
 }
 
 const DEFAULT_IMAGE = 'zeroshot-cluster-base';
@@ -68,6 +82,7 @@ class IsolationManager {
    * @param {boolean} [config.reuseExistingWorkspace=false] - If true, reuse existing isolated workspace (for resume)
    * @param {Array<string|object>} [config.mounts] - Override default mounts (preset names or {host, container, readonly})
    * @param {boolean} [config.noMounts=false] - Disable all credential mounts
+   * @param {string} [config.provider] - Provider name for credential warnings
    * @returns {Promise<string>} Container ID
    */
   async createContainer(clusterId, config) {
@@ -117,6 +132,7 @@ class IsolationManager {
 
     // Resolve container home directory EARLY - needed for Claude config mount and hooks
     const settings = loadSettings();
+    const providerName = config.provider || settings.defaultProvider || 'anthropic';
     const containerHome = config.containerHome || settings.dockerContainerHome || '/root';
 
     // Create fresh Claude config dir for this cluster (avoids permission issues from host)
@@ -145,6 +161,8 @@ class IsolationManager {
       `${clusterConfigDir}:${containerHome}/.claude`,
     ];
 
+    const mountedHosts = [];
+
     // Add configurable credential mounts
     // Priority: CLI config > env var > settings > defaults
     if (!config.noMounts) {
@@ -168,9 +186,18 @@ class IsolationManager {
 
       // Resolve presets to actual mount specs (containerHome already resolved above)
       const mounts = resolveMounts(mountConfig, { containerHome });
+      const claudeContainerPath = path.posix.join(containerHome, '.claude');
 
       for (const mount of mounts) {
-        const hostPath = mount.host.replace(/^~/, os.homedir());
+        if (mount.container === claudeContainerPath) {
+          console.warn(
+            `[IsolationManager] Skipping mount for ${mount.host} -> ${mount.container} ` +
+              '(Claude config is managed by zeroshot).'
+          );
+          continue;
+        }
+
+        const hostPath = expandHomePath(mount.host);
 
         // Check path exists and is mountable
         try {
@@ -188,12 +215,11 @@ class IsolationManager {
           ? `${hostPath}:${mount.container}:ro`
           : `${hostPath}:${mount.container}`;
         args.push('-v', mountSpec);
+        mountedHosts.push(hostPath);
       }
 
       // Pass env vars based on enabled presets
-      const envSpecs = expandEnvPatterns(
-        resolveEnvs(mountConfig, settings.dockerEnvPassthrough)
-      );
+      const envSpecs = expandEnvPatterns(resolveEnvs(mountConfig, settings.dockerEnvPassthrough));
       for (const spec of envSpecs) {
         if (spec.forced) {
           // Forced value - always pass with specified value
@@ -205,15 +231,30 @@ class IsolationManager {
       }
     }
 
+    // Warn when provider credentials are likely missing
+    if (providerName !== 'anthropic') {
+      const provider = getProvider(providerName);
+      const credentialPaths = provider.getCredentialPaths ? provider.getCredentialPaths() : [];
+      const expandedCreds = credentialPaths.map((cred) => expandHomePath(cred));
+      const hasCredentialMount = mountedHosts.some((hostPath) =>
+        expandedCreds.some(
+          (credPath) => pathContains(hostPath, credPath) || pathContains(credPath, hostPath)
+        )
+      );
+
+      if (!hasCredentialMount && expandedCreds.length > 0) {
+        const exampleHost = credentialPaths[0];
+        const exampleContainer = exampleHost.replace(/^~(?=\/|$)/, containerHome);
+        const mountNote = config.noMounts ? 'Credential mounts are disabled. ' : '';
+        console.warn(
+          `[IsolationManager] ⚠️  ${mountNote}No credential mounts found for ${provider.displayName}. ` +
+            `Add one with --mount ${exampleHost}:${exampleContainer}:ro`
+        );
+      }
+    }
+
     // Finish docker args
-    args.push(
-      '-w',
-      '/workspace',
-      image,
-      'tail',
-      '-f',
-      '/dev/null'
-    );
+    args.push('-w', '/workspace', image, 'tail', '-f', '/dev/null');
 
     return new Promise((resolve, reject) => {
       const proc = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -243,17 +284,25 @@ class IsolationManager {
               // Check if node_modules already exists in container (pre-baked or previous run)
               const checkResult = await this.execInContainer(
                 clusterId,
-                ['sh', '-c', 'test -d node_modules && test -f node_modules/.package-lock.json && echo "exists"'],
+                [
+                  'sh',
+                  '-c',
+                  'test -d node_modules && test -f node_modules/.package-lock.json && echo "exists"',
+                ],
                 {}
               );
 
               if (checkResult.code === 0 && checkResult.stdout.trim() === 'exists') {
-                console.log(`[IsolationManager] ✓ Dependencies already installed (skipping npm install)`);
+                console.log(
+                  `[IsolationManager] ✓ Dependencies already installed (skipping npm install)`
+                );
               } else {
                 // Check if npm is available in container
                 const npmCheck = await this.execInContainer(clusterId, ['which', 'npm'], {});
                 if (npmCheck.code !== 0) {
-                  console.log(`[IsolationManager] npm not available in container, skipping dependency install`);
+                  console.log(
+                    `[IsolationManager] npm not available in container, skipping dependency install`
+                  );
                 } else {
                   // Issue #20: Try to use pre-baked dependencies first
                   // Check if pre-baked deps exist and can satisfy project requirements
@@ -264,7 +313,9 @@ class IsolationManager {
                   );
 
                   if (preBakeCheck.code === 0 && preBakeCheck.stdout.trim() === 'exists') {
-                    console.log(`[IsolationManager] Checking if pre-baked deps satisfy requirements...`);
+                    console.log(
+                      `[IsolationManager] Checking if pre-baked deps satisfy requirements...`
+                    );
 
                     // Copy pre-baked deps, then run npm install to add any missing
                     // This is faster than full npm install: copy is ~2s, npm install adds ~5-10s for missing
@@ -280,18 +331,30 @@ class IsolationManager {
                       // Run npm install to add any missing deps (much faster with pre-baked base)
                       const installResult = await this.execInContainer(
                         clusterId,
-                        ['sh', '-c', 'npm_config_engine_strict=false npm install --no-audit --no-fund --prefer-offline'],
+                        [
+                          'sh',
+                          '-c',
+                          'npm_config_engine_strict=false npm install --no-audit --no-fund --prefer-offline',
+                        ],
                         {}
                       );
 
                       if (installResult.code === 0) {
-                        console.log(`[IsolationManager] ✓ Dependencies installed (pre-baked + incremental)`);
+                        console.log(
+                          `[IsolationManager] ✓ Dependencies installed (pre-baked + incremental)`
+                        );
                       } else {
                         // Fallback: full install (pre-baked copy may have caused issues)
-                        console.warn(`[IsolationManager] Incremental install failed, falling back to full install`);
+                        console.warn(
+                          `[IsolationManager] Incremental install failed, falling back to full install`
+                        );
                         await this.execInContainer(
                           clusterId,
-                          ['sh', '-c', 'rm -rf node_modules && npm_config_engine_strict=false npm install --no-audit --no-fund'],
+                          [
+                            'sh',
+                            '-c',
+                            'rm -rf node_modules && npm_config_engine_strict=false npm install --no-audit --no-fund',
+                          ],
                           {}
                         );
                         console.log(`[IsolationManager] ✓ Dependencies installed (full fallback)`);
@@ -310,7 +373,11 @@ class IsolationManager {
                       try {
                         installResult = await this.execInContainer(
                           clusterId,
-                          ['sh', '-c', 'npm_config_engine_strict=false npm install --no-audit --no-fund'],
+                          [
+                            'sh',
+                            '-c',
+                            'npm_config_engine_strict=false npm install --no-audit --no-fund',
+                          ],
                           {}
                         );
 
@@ -321,7 +388,11 @@ class IsolationManager {
 
                         // Failed - retry if not last attempt
                         // Use stderr if available, otherwise stdout (npm writes some errors to stdout)
-                        const errorOutput = (installResult.stderr || installResult.stdout || '').slice(0, 500);
+                        const errorOutput = (
+                          installResult.stderr ||
+                          installResult.stdout ||
+                          ''
+                        ).slice(0, 500);
                         if (attempt < maxRetries) {
                           const delay = baseDelay * Math.pow(2, attempt - 1);
                           console.warn(
@@ -542,7 +613,9 @@ class IsolationManager {
       const isolatedInfo = this.isolatedDirs.get(clusterId);
 
       if (preserveWorkspace) {
-        console.log(`[IsolationManager] Preserving isolated workspace at ${isolatedInfo.path} for resume`);
+        console.log(
+          `[IsolationManager] Preserving isolated workspace at ${isolatedInfo.path} for resume`
+        );
         // Don't delete - but DON'T remove from Map either, resume() needs it
       } else {
         console.log(`[IsolationManager] Cleaning up isolated dir at ${isolatedInfo.path}`);
@@ -896,7 +969,10 @@ class IsolationManager {
         ],
       },
     };
-    fs.writeFileSync(path.join(configDir, 'settings.json'), JSON.stringify(clusterSettings, null, 2));
+    fs.writeFileSync(
+      path.join(configDir, 'settings.json'),
+      JSON.stringify(clusterSettings, null, 2)
+    );
 
     // Track for cleanup
     this.clusterConfigDirs = this.clusterConfigDirs || new Map();
@@ -990,9 +1066,12 @@ class IsolationManager {
    */
   _isContainerRunning(containerId) {
     try {
-      const result = execSync(`docker inspect -f '{{.State.Running}}' ${escapeShell(containerId)} 2>/dev/null`, {
-        encoding: 'utf8',
-      });
+      const result = execSync(
+        `docker inspect -f '{{.State.Running}}' ${escapeShell(containerId)} 2>/dev/null`,
+        {
+          encoding: 'utf8',
+        }
+      );
       return result.trim() === 'true';
     } catch {
       return false;
@@ -1017,7 +1096,8 @@ class IsolationManager {
    */
   static isDockerAvailable() {
     try {
-      execSync('docker --version', { encoding: 'utf8', stdio: 'pipe' });
+      // Require both CLI binary and a reachable daemon.
+      execSync('docker info', { encoding: 'utf8', stdio: 'pipe' });
       return true;
     } catch {
       return false;
@@ -1146,14 +1226,16 @@ class IsolationManager {
 
   /**
    * Create worktree-based isolation for a cluster (lightweight alternative to Docker)
-   * Creates a git worktree at /tmp/zeroshot-worktrees/{clusterId}
+   * Creates a git worktree at {os.tmpdir()}/zeroshot-worktrees/{clusterId}
    * @param {string} clusterId - Cluster ID
    * @param {string} workDir - Original working directory (must be a git repo)
    * @returns {{ path: string, branch: string, repoRoot: string }}
    */
   createWorktreeIsolation(clusterId, workDir) {
     if (!this._isGitRepo(workDir)) {
-      throw new Error(`Worktree isolation requires a git repository. ${workDir} is not a git repo.`);
+      throw new Error(
+        `Worktree isolation requires a git repository. ${workDir} is not a git repo.`
+      );
     }
 
     const worktreeInfo = this.createWorktree(clusterId, workDir);

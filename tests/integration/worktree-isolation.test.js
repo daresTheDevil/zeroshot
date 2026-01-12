@@ -2,7 +2,7 @@
  * Test: Worktree Isolation - Lightweight git-based isolation
  *
  * Tests the worktree isolation mode that provides:
- * - Git worktree creation at /tmp/zeroshot-worktrees/{clusterId}
+ * - Git worktree creation at {os.tmpdir()}/zeroshot-worktrees/{clusterId}
  * - Separate branch (zeroshot/{clusterId}) without copying files
  * - Fast setup (<1s vs 30-60s for Docker)
  * - No Docker dependency
@@ -64,7 +64,12 @@ describe('IsolationManager - Worktree Mode', function () {
       const info = manager.createWorktreeIsolation(testClusterId, testRepoDir);
 
       assert(info.path, 'Should return worktree path');
-      assert(info.path.includes('/tmp/zeroshot-worktrees/'), 'Path should be in tmp');
+      const expectedRoot = fs.realpathSync(path.join(os.tmpdir(), 'zeroshot-worktrees'));
+      const worktreePath = fs.realpathSync(info.path);
+      assert(
+        worktreePath.startsWith(expectedRoot + path.sep),
+        `Path should be in ${expectedRoot}${path.sep}`
+      );
       assert(info.path.includes(testClusterId), 'Path should include cluster ID');
       assert(fs.existsSync(info.path), 'Worktree directory should exist');
     });
@@ -73,7 +78,10 @@ describe('IsolationManager - Worktree Mode', function () {
       const info = manager.createWorktreeIsolation(testClusterId, testRepoDir);
 
       assert(info.branch, 'Should return branch name');
-      assert(info.branch.startsWith('zeroshot/'), `Branch should start with zeroshot/, got: ${info.branch}`);
+      assert(
+        info.branch.startsWith('zeroshot/'),
+        `Branch should start with zeroshot/, got: ${info.branch}`
+      );
 
       // Verify branch exists in main repo
       const branches = execSync('git branch --list', { cwd: testRepoDir, encoding: 'utf8' });
@@ -83,7 +91,11 @@ describe('IsolationManager - Worktree Mode', function () {
     it('should return correct repoRoot', function () {
       const info = manager.createWorktreeIsolation(testClusterId, testRepoDir);
 
-      assert.strictEqual(info.repoRoot, testRepoDir, 'repoRoot should match source directory');
+      assert.strictEqual(
+        fs.realpathSync(info.repoRoot),
+        fs.realpathSync(testRepoDir),
+        'repoRoot should match source directory'
+      );
     });
 
     it('should create working git repo in worktree', function () {
@@ -92,7 +104,7 @@ describe('IsolationManager - Worktree Mode', function () {
       // Verify it's a valid git worktree
       const gitDir = execSync('git rev-parse --git-dir', {
         cwd: info.path,
-        encoding: 'utf8'
+        encoding: 'utf8',
       }).trim();
 
       // Worktrees have .git file pointing to main repo's .git/worktrees/{name}
@@ -115,7 +127,7 @@ describe('IsolationManager - Worktree Mode', function () {
 
       const currentBranch = execSync('git branch --show-current', {
         cwd: info.path,
-        encoding: 'utf8'
+        encoding: 'utf8',
       }).trim();
 
       assert.strictEqual(currentBranch, info.branch, 'Worktree should be on the new branch');

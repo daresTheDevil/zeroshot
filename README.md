@@ -6,7 +6,7 @@
 [![Node 18+](https://img.shields.io/badge/node-18%2B-brightgreen.svg)](https://nodejs.org/)
 ![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg)
 
-Zeroshot is a multi-agent coordination engine for Claude Code. It runs a planner, worker, and validators in isolated contexts, iterating until validators approve or reject with concrete issues.
+Zeroshot is a multi-agent coordination engine for Claude Code, OpenAI Codex, and Google Gemini CLIs. It runs a planner, worker, and validators in isolated contexts, iterating until validators approve or reject with concrete issues.
 
 ## Quick Start
 
@@ -22,6 +22,18 @@ zeroshot run "Add optimistic locking with automatic retry: when updating a user,
 retry with exponential backoff up to 3 times, merge non-conflicting field changes,
 and surface conflicts with details. Handle the ABA problem where version goes A->B->A."
 ```
+
+## Providers
+
+Zeroshot shells out to provider CLIs. Pick a default and override per run:
+
+```bash
+zeroshot providers
+zeroshot providers set-default openai
+zeroshot run 123 --provider google
+```
+
+See `docs/providers.md` for setup, model levels, and Docker mounts.
 
 ## Why Multiple Agents?
 
@@ -76,10 +88,20 @@ Rule of thumb: if you cannot describe what "done" means, validators cannot verif
 npm install -g @covibes/zeroshot
 ```
 
-**Requires**: Node 18+, [Claude Code CLI](https://claude.com/product/claude-code), [GitHub CLI](https://cli.github.com/)
+**Requires**: Node 18+, at least one provider CLI (Claude Code, Codex, Gemini). [GitHub CLI](https://cli.github.com/) is required when running by issue number.
 
 ```bash
-npm i -g @anthropic-ai/claude-code && claude auth login
+# Install one or more providers
+npm i -g @anthropic-ai/claude-code
+npm i -g @openai/codex
+npm i -g @google/gemini-cli
+
+# Authenticate with the provider CLI
+claude login        # Anthropic
+codex login         # OpenAI
+gemini auth login   # Google
+
+# GitHub auth (for issue numbers)
 gh auth login
 ```
 
@@ -110,6 +132,10 @@ zeroshot resume <id>
 zeroshot stop <id>
 zeroshot kill <id>
 zeroshot watch
+
+# Providers
+zeroshot providers
+zeroshot providers set-default openai
 
 # Agent library
 zeroshot agents list
@@ -143,12 +169,13 @@ Zeroshot is a message-driven coordination layer with smart defaults.
 
 | Complexity | Planner | Worker | Validators |
 | ---------- | ------- | ------ | ---------- |
-| TRIVIAL    | -       | haiku  | -          |
-| SIMPLE     | -       | sonnet | 1 (sonnet) |
-| STANDARD   | sonnet  | sonnet | 2 (sonnet) |
-| CRITICAL   | opus    | sonnet | 5 (sonnet) |
+| TRIVIAL    | -       | level1 | -          |
+| SIMPLE     | -       | level2 | 1 (level2) |
+| STANDARD   | level2  | level2 | 2 (level2) |
+| CRITICAL   | level3  | level2 | 5 (level2) |
 
-Set model ceiling: `zeroshot settings set maxModel sonnet`.
+Levels map to provider-specific models. Configure with `zeroshot providers setup <provider>` or
+`settings.providerSettings`. (Legacy `maxModel` applies to Anthropic only.)
 
 <details>
 <summary><strong>Custom Workflows (Framework Mode)</strong></summary>
@@ -167,14 +194,14 @@ Zeroshot is message-driven, so you can define any agent topology.
 - Ledger (SQLite, crash recovery)
 - Dynamic spawning (CLUSTER_OPERATIONS)
 
-#### Creating Custom Clusters with Claude Code
+#### Creating Custom Clusters with a Provider CLI
 
-Start Claude Code and describe your cluster:
+Start your provider CLI and describe your cluster:
 
 ```
 Create a zeroshot cluster config for security-critical features:
 
-1. Implementation agent (sonnet) implements the feature
+1. Implementation agent (level2) implements the feature
 2. FOUR parallel validators:
    - Security validator: OWASP checks, SQL injection, XSS, CSRF
    - Performance validator: No N+1 queries, proper indexing
@@ -183,7 +210,7 @@ Create a zeroshot cluster config for security-critical features:
 
 3. ALL validators must approve before merge
 4. If ANY validator rejects, implementation agent fixes and resubmits
-5. Use opus for security validator (highest stakes)
+5. Use level3 for security validator (highest stakes)
 
 Look at cluster-templates/base-templates/full-workflow.json
 and create a similar cluster. Save to cluster-templates/security-review.json
@@ -236,11 +263,11 @@ Full isolation in a fresh container. Your workspace stays untouched. Useful for 
 <details>
 <summary><strong>Docker Credential Mounts</strong></summary>
 
-When using `--docker`, zeroshot mounts credential directories so agents can access tools like AWS, Azure, and kubectl.
+When using `--docker`, zeroshot mounts credential directories so agents can access provider CLIs and tools like AWS, Azure, and kubectl.
 
 **Default mounts**: `gh`, `git`, `ssh` (GitHub CLI, git config, SSH keys)
 
-**Available presets**: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`
+**Available presets**: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`, `claude`, `codex`, `gemini`
 
 ```bash
 # Configure via settings (persistent)
@@ -252,12 +279,18 @@ zeroshot settings get dockerMounts
 # Per-run override
 zeroshot run 123 --docker --mount ~/.aws:/root/.aws:ro
 
+# Provider credentials
+zeroshot run 123 --docker --mount ~/.config/codex:/home/node/.config/codex:ro
+zeroshot run 123 --docker --mount ~/.config/gemini:/home/node/.config/gemini:ro
+
 # Disable all mounts
 zeroshot run 123 --docker --no-mounts
 
 # CI: env var override
 ZEROSHOT_DOCKER_MOUNTS='["aws","azure"]' zeroshot run 123 --docker
 ```
+
+See `docs/providers.md` for provider CLI setup and mount details.
 
 **Custom mounts** (mix presets with explicit paths):
 
@@ -288,6 +321,7 @@ zeroshot settings set dockerEnvPassthrough '["MY_API_KEY", "TF_VAR_*"]'
 ## Resources
 
 - [CLAUDE.md](./CLAUDE.md) - Architecture, cluster config schema, agent primitives
+- `docs/providers.md` - Provider setup, model levels, and Docker mounts
 - [Discord](https://discord.gg/PdZ3UEXB) - Support and community
 - `zeroshot export <id>` - Export conversation to markdown
 - `sqlite3 ~/.zeroshot/*.db` - Direct ledger access for debugging
@@ -298,6 +332,8 @@ zeroshot settings set dockerEnvPassthrough '["MY_API_KEY", "TF_VAR_*"]'
 | Issue                         | Fix                                                       |
 | ----------------------------- | --------------------------------------------------------- |
 | `claude: command not found`   | `npm i -g @anthropic-ai/claude-code && claude auth login` |
+| `codex: command not found`    | `npm i -g @openai/codex && codex login`                   |
+| `gemini: command not found`   | `npm i -g @google/gemini-cli && gemini auth login`        |
 | `gh: command not found`       | [Install GitHub CLI](https://cli.github.com/)             |
 | `--docker` fails              | Docker must be running: `docker ps` to verify             |
 | Cluster stuck                 | `zeroshot resume <id>` to continue                        |

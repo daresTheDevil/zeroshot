@@ -67,6 +67,8 @@ describe('Settings System', function () {
     assert.strictEqual(DEFAULT_SETTINGS.defaultDocker, false);
     assert.strictEqual(DEFAULT_SETTINGS.strictSchema, true);
     assert.strictEqual(DEFAULT_SETTINGS.logLevel, 'normal');
+    assert.strictEqual(DEFAULT_SETTINGS.defaultProvider, 'anthropic');
+    assert.ok(DEFAULT_SETTINGS.providerSettings);
   });
 
   it('should load default settings when file does not exist', function () {

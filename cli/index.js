@@ -21,7 +21,6 @@ const os = require('os');
 const chalk = require('chalk');
 const Orchestrator = require('../src/orchestrator');
 const { setupCompletion } = require('../lib/completion');
-const { parseChunk } = require('../lib/stream-json-parser');
 const { formatWatchMode } = require('./message-formatters-watch');
 const {
   formatAgentLifecycle,
@@ -46,8 +45,10 @@ const {
   coerceValue,
   DEFAULT_SETTINGS,
 } = require('../lib/settings');
+const { getProvider, parseProviderChunk } = require('../src/providers');
 const { MOUNT_PRESETS, resolveEnvs } = require('../lib/docker-config');
 const { requirePreflight } = require('../src/preflight');
+const { providersCommand, setDefaultCommand, setupCommand } = require('./commands/providers');
 // Setup wizard removed - use: zeroshot settings set <key> <value>
 const { checkForUpdates } = require('./lib/update-checker');
 const { StatusFooter, AGENT_STATE, ACTIVE_STATES } = require('../src/status-footer');
@@ -392,7 +393,7 @@ if (shouldShowBanner) {
 
 program
   .name('zeroshot')
-  .description('Multi-agent orchestration and task management for Claude')
+  .description('Multi-agent orchestration and task management for Claude, Codex, and Gemini')
   .version(require('../package.json').version)
   .option('-q, --quiet', 'Suppress prompts (first-run wizard, update checks)')
   .addHelpText(
@@ -420,6 +421,7 @@ Examples:
   ${chalk.cyan('zeroshot purge -y')}                   Purge everything without confirmation
   ${chalk.cyan('zeroshot settings')}                   Show/manage zeroshot settings (maxModel, config, etc.)
   ${chalk.cyan('zeroshot settings set <key> <val>')}   Set a setting (e.g., maxModel haiku)
+  ${chalk.cyan('zeroshot providers')}                  Show provider status and defaults
   ${chalk.cyan('zeroshot config list')}                List available cluster configs
   ${chalk.cyan('zeroshot config show <name>')}         Visualize a cluster config (agents, triggers, flow)
   ${chalk.cyan('zeroshot export <id>')}                Export cluster conversation to file
@@ -461,7 +463,11 @@ program
     'Full automation: worktree isolation + PR + auto-merge (use --docker for Docker)'
   )
   .option('--workers <n>', 'Max sub-agents for worker to spawn in parallel', parseInt)
-  .option('--model <model>', 'Override all agent models (opus, sonnet, haiku)')
+  .option(
+    '--provider <provider>',
+    'Override all agents to use a provider (anthropic, openai, google)'
+  )
+  .option('--model <model>', 'Override all agent models (provider-specific model id)')
   .option('-d, --detach', 'Run in background (default: attach to first agent)')
   .option('--mount <spec...>', 'Add Docker mount (host:container[:ro]). Repeatable.')
   .option('--no-mounts', 'Disable all Docker credential mounts')
@@ -527,11 +533,15 @@ Input formats:
       // === PREFLIGHT CHECKS ===
       // Validate all dependencies BEFORE starting anything
       // This gives users clear, actionable error messages upfront
+      const settings = loadSettings();
+      const providerOverride =
+        options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider;
       const preflightOptions = {
         requireGh: !!input.issue, // gh CLI required when fetching GitHub issues
         requireDocker: options.docker, // Docker required for --docker mode
         requireGit: options.worktree, // Git required for worktree isolation
         quiet: process.env.ZEROSHOT_DAEMON === '1', // Suppress success in daemon mode
+        provider: providerOverride,
       };
       requirePreflight(preflightOptions);
 
@@ -584,6 +594,7 @@ Input formats:
             ZEROSHOT_WORKTREE: options.worktree ? '1' : '',
             ZEROSHOT_WORKERS: options.workers?.toString() || '',
             ZEROSHOT_MODEL: options.model || '',
+            ZEROSHOT_PROVIDER: options.provider || '',
             ZEROSHOT_CWD: targetCwd, // Explicit CWD for orchestrator
           },
         });
@@ -594,8 +605,6 @@ Input formats:
       }
 
       // === FOREGROUND MODE (default) or DAEMON CHILD ===
-      // Load user settings
-      const settings = loadSettings();
 
       // Use cluster ID from env (daemon mode) or generate new one (foreground mode)
       // IMPORTANT: Set env var so orchestrator picks it up
@@ -627,6 +636,20 @@ Input formats:
       const orchestrator = getOrchestrator();
       config = orchestrator.loadConfig(configPath);
 
+      if (!config.defaultProvider) {
+        config.defaultProvider = settings.defaultProvider || 'anthropic';
+      }
+
+      if (providerOverride) {
+        const provider = getProvider(providerOverride);
+        const providerSettings = settings.providerSettings?.[providerOverride] || {};
+        config.forceProvider = providerOverride;
+        config.defaultProvider = providerOverride;
+        config.forceLevel = providerSettings.defaultLevel || provider.getDefaultLevel();
+        config.defaultLevel = config.forceLevel;
+        console.log(chalk.dim(`Provider override: ${providerOverride} (all agents)`));
+      }
+
       // Track for global error handler cleanup
       activeClusterId = clusterId;
       orchestratorInstance = orchestrator;
@@ -656,13 +679,27 @@ Input formats:
       // Apply model override to all agents (CLI > env)
       const modelOverride = options.model || process.env.ZEROSHOT_MODEL;
       if (modelOverride) {
-        // Validate model against maxModel ceiling
-        const { validateModelAgainstMax } = require('../lib/settings');
-        try {
-          validateModelAgainstMax(modelOverride, settings.maxModel);
-        } catch (err) {
-          console.error(chalk.red(`Error: ${err.message}`));
-          process.exit(1);
+        const providerName =
+          providerOverride || config.defaultProvider || settings.defaultProvider || 'anthropic';
+        const provider = getProvider(providerName);
+        const catalog = provider.getModelCatalog();
+
+        if (catalog && !catalog[modelOverride]) {
+          console.warn(
+            chalk.yellow(
+              `Warning: model override "${modelOverride}" is not in the ${providerName} catalog`
+            )
+          );
+        }
+
+        if (providerName === 'anthropic' && ['opus', 'sonnet', 'haiku'].includes(modelOverride)) {
+          const { validateModelAgainstMax } = require('../lib/settings');
+          try {
+            validateModelAgainstMax(modelOverride, settings.maxModel);
+          } catch (err) {
+            console.error(chalk.red(`Error: ${err.message}`));
+            process.exit(1);
+          }
         }
 
         // Override all agent models
@@ -689,6 +726,7 @@ Input formats:
         autoPush: process.env.ZEROSHOT_PUSH === '1',
         // Model override (for dynamically added agents)
         modelOverride: modelOverride || undefined,
+        providerOverride: providerOverride || undefined,
         // Docker mount options
         noMounts: options.noMounts || false,
         mounts: options.mount ? parseMountSpecs(options.mount) : undefined,
@@ -887,8 +925,12 @@ taskCmd
   .command('run <prompt>')
   .description('Run a single-agent background task')
   .option('-C, --cwd <path>', 'Working directory for task')
-  .option('-r, --resume <sessionId>', 'Resume a specific Claude session')
-  .option('-c, --continue', 'Continue the most recent session')
+  .option('--provider <provider>', 'Provider to use (anthropic, openai, google)')
+  .option('--model <model>', 'Model id override for the provider')
+  .option('--model-level <level>', 'Model level override (level1, level2, level3)')
+  .option('--reasoning-effort <effort>', 'Reasoning effort (low, medium, high, xhigh)')
+  .option('-r, --resume <sessionId>', 'Resume a specific Claude session (anthropic only)')
+  .option('-c, --continue', 'Continue the most recent Claude session (anthropic only)')
   .option(
     '-o, --output-format <format>',
     'Output format: stream-json (default), text, json',
@@ -899,11 +941,15 @@ taskCmd
   .action(async (prompt, options) => {
     try {
       // === PREFLIGHT CHECKS ===
-      // Claude CLI must be installed and authenticated for task execution
+      // Provider CLI must be installed for task execution
+      const settings = loadSettings();
+      const providerOverride =
+        options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider;
       requirePreflight({
         requireGh: false, // gh not needed for plain tasks
         requireDocker: false, // Docker not needed for plain tasks
         quiet: false,
+        provider: providerOverride,
       });
 
       // Dynamically import task command (ESM module)
@@ -2190,17 +2236,24 @@ program
       // Check if cluster exists
       const cluster = orchestrator.getCluster(id);
 
-      // === PREFLIGHT CHECKS ===
-      // Claude CLI must be installed and authenticated
-      // Check if cluster uses isolation (needs Docker)
-      const requiresDocker = cluster?.isolation?.enabled || false;
-      requirePreflight({
-        requireGh: false, // Resume doesn't fetch new issues
-        requireDocker: requiresDocker,
-        quiet: false,
-      });
+      const settings = loadSettings();
 
       if (cluster) {
+        // === PREFLIGHT CHECKS ===
+        // Provider CLI must be installed; Docker needed if isolation was used
+        const requiresDocker = cluster?.isolation?.enabled || false;
+        const providerName =
+          cluster.config?.forceProvider ||
+          cluster.config?.defaultProvider ||
+          settings.defaultProvider;
+
+        requirePreflight({
+          requireGh: false, // Resume doesn't fetch new issues
+          requireDocker: requiresDocker,
+          quiet: false,
+          provider: providerName,
+        });
+
         // Resume cluster
         console.log(chalk.cyan(`Resuming cluster ${id}...`));
         const result = await orchestrator.resume(id, prompt);
@@ -2315,6 +2368,24 @@ program
 
         console.log(chalk.dim(`\nCluster ${id} completed.`));
       } else {
+        let providerName = settings.defaultProvider;
+        try {
+          const { getTask } = await import('../task-lib/store.js');
+          const task = getTask(id);
+          if (task?.provider) {
+            providerName = task.provider;
+          }
+        } catch {
+          // If task store is unavailable, fall back to default provider
+        }
+
+        requirePreflight({
+          requireGh: false,
+          requireDocker: false,
+          quiet: false,
+          provider: providerName,
+        });
+
         // Try resuming as task
         const { resumeTask } = await import('../task-lib/commands/resume.js');
         await resumeTask(id, prompt);
@@ -2909,7 +2980,9 @@ function formatSettingsList(settings, showUsage = false) {
     console.log(chalk.dim('  zeroshot settings set dockerEnvPassthrough \'["AWS_*","TF_VAR_*"]\''));
     console.log('');
     console.log(
-      chalk.dim('Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud')
+      chalk.dim(
+        'Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud, claude, codex, gemini'
+      )
     );
     console.log('');
   }
@@ -3003,6 +3076,26 @@ settingsCmd.action(() => {
   const settings = loadSettings();
   formatSettingsList(settings, true);
 });
+
+// Providers management
+const providersCmd = program.command('providers').description('Manage AI providers');
+providersCmd.action(async () => {
+  await providersCommand();
+});
+
+providersCmd
+  .command('set-default <provider>')
+  .description('Set default provider (anthropic, openai, google)')
+  .action(async (provider) => {
+    await setDefaultCommand([provider]);
+  });
+
+providersCmd
+  .command('setup <provider>')
+  .description('Configure provider model levels and overrides')
+  .action(async (provider) => {
+    await setupCommand([provider]);
+  });
 
 // Update command
 program
@@ -3926,7 +4019,8 @@ function renderMessagesToTerminal(clusterId, messages) {
       const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
       if (!content || !content.trim()) continue;
 
-      const events = parseChunk(content);
+      const provider = msg.content?.data?.provider || msg.sender_provider || 'anthropic';
+      const events = parseProviderChunk(provider, content);
       for (const event of events) {
         switch (event.type) {
           case 'text':
@@ -4225,7 +4319,7 @@ const FILTERED_PATTERNS = [
   /^--- Following log/,
   /--- Following logs/,
   /Ctrl\+C to stop/,
-  /^=== Claude Task:/,
+  /^=== (Claude|Codex|Gemini) Task:/,
   /^Started:/,
   /^Finished:/,
   /^Exit code:/,
@@ -4320,7 +4414,8 @@ function printMessage(msg, showClusterId = false, watchMode = false, isActive = 
     if (!content || !content.trim()) return;
 
     // Parse streaming JSON events using the parser
-    const events = parseChunk(content);
+    const provider = msg.content?.data?.provider || msg.sender_provider || 'anthropic';
+    const events = parseProviderChunk(provider, content);
 
     for (const event of events) {
       switch (event.type) {
