@@ -67,9 +67,7 @@ function validateTemplate(filePath) {
 function main() {
   console.log('Validating cluster templates...\n');
 
-  const templateFiles = [
-    ...findJsonFiles(TEMPLATES_DIR),
-  ];
+  const templateFiles = [...findJsonFiles(TEMPLATES_DIR)];
 
   let hasErrors = false;
   let validated = 0;

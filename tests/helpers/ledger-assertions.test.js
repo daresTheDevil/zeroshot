@@ -391,7 +391,17 @@ describe('LedgerAssertions', function () {
       const insert = ledger.db.prepare(
         'INSERT INTO messages (id, timestamp, topic, sender, receiver, content_text, content_data, metadata, cluster_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
       );
-      insert.run('msg_a', baseTime + 1000, 'TEST', 'agent-a', 'broadcast', null, null, null, clusterId);
+      insert.run(
+        'msg_a',
+        baseTime + 1000,
+        'TEST',
+        'agent-a',
+        'broadcast',
+        null,
+        null,
+        null,
+        clusterId
+      );
       insert.run('msg_b', baseTime, 'TEST', 'agent-b', 'broadcast', null, null, null, clusterId);
       ledger.cache.clear();
 

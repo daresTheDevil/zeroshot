@@ -86,11 +86,7 @@ export function recoverStructuredOutput(sessionId) {
       if (!Array.isArray(content)) continue;
 
       for (const block of content) {
-        if (
-          block?.type === 'tool_use' &&
-          block?.name === 'StructuredOutput' &&
-          block?.input
-        ) {
+        if (block?.type === 'tool_use' && block?.name === 'StructuredOutput' && block?.input) {
           structuredOutput = block.input;
           if (message?.usage && typeof message.usage === 'object') {
             usage = message.usage;

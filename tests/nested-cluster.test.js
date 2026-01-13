@@ -307,5 +307,4 @@ describe('Nested Cluster', function () {
       assert.strictEqual(bridge.isActive(), false);
     });
   });
-
 });
