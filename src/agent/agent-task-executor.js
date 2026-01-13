@@ -16,6 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const { exec, execSync } = require('../lib/safe-exec'); // Enforces timeouts - prevents infinite hangs
 const { getProvider, parseChunkWithProvider } = require('../providers');
+const { getTask } = require('../../task-lib/store.js');
 
 // Schema utilities for normalizing LLM output
 const { normalizeEnumValues } = require('./schema-utils');
@@ -542,6 +543,15 @@ async function spawnClaudeTask(agent, context) {
 
   // Wait for task to be registered in zeroshot storage (race condition fix)
   await waitForTaskReady(agent, taskId);
+
+  // CRITICAL: Update agent.processPid with the REAL Claude process PID
+  // The initial proc.pid was the wrapper script which exits immediately.
+  // The watcher updates tasks.json with the actual Claude process PID.
+  const taskInfo = getTask(taskId);
+  if (taskInfo?.pid) {
+    agent.processPid = taskInfo.pid;
+    agent._log(`📋 Agent ${agent.id}: Real process PID: ${taskInfo.pid}`);
+  }
 
   // Now follow the logs and stream output
   return followClaudeTaskLogs(agent, taskId);
