@@ -1,5 +1,5 @@
 ---
-description: Analyze cluster failures to OPTIMIZE PROMPTS - make agents work for EVERY use case
+description: Postmortem analysis of cluster failures → OPTIMIZE PROMPTS to work for EVERY use case
 argument-hint: <cluster-id or "recent" or "dump">
 ---
 
@@ -234,12 +234,35 @@ After applying fixes, this cluster type should:
 - [ ] [Another behavior]
 ```
 
-## Step 7: Apply Fixes
+## Step 7: Ask User What To Do
 
-1. **Edit the config file** with improved prompts
-2. **Run the same task again** to verify fix works
-3. **Check if fix breaks other use cases** - run a few different task types
-4. **Commit the improvement**
+After presenting the analysis and proposed fixes, **ASK THE USER** what they want to do:
+
+```
+Use AskUserQuestion tool with options:
+1. "Create GitHub issue" - Create issue with analysis and proposed fixes
+2. "Apply fixes locally" - Apply fixes now, I'll test and commit
+3. "Just the analysis" - Do nothing, I'll handle it manually
+```
+
+**If user chooses "Create GitHub issue":**
+
+1. Create issue with title: `fix(prompts): [brief description of prompt gap]`
+2. Body contains:
+   - The full analysis report from Step 6
+   - Proposed fixes with before/after diffs
+   - Cluster ID that revealed the issue
+   - Verification checklist
+3. Label: `prompt-optimization`
+
+**If user chooses "Apply fixes locally":**
+
+1. Apply the prompt fixes to config files
+2. Tell user to test with similar task and commit when ready
+
+**If user chooses "Just the analysis":**
+
+1. Do nothing - user has the report and will handle it
 
 ## Common Prompt Gaps
 
