@@ -369,17 +369,17 @@ zeroshot settings set dockerEnvPassthrough '["MY_API_KEY", "TF_VAR_*"]'
 <details>
 <summary><strong>Troubleshooting</strong></summary>
 
-| Issue                         | Fix                                                       |
-| ----------------------------- | --------------------------------------------------------- |
-| `claude: command not found`   | `npm i -g @anthropic-ai/claude-code && claude auth login` |
-| `codex: command not found`    | `npm i -g @openai/codex && codex login`                   |
-| `gemini: command not found`   | `npm i -g @google/gemini-cli && gemini auth login`        |
-| `gh: command not found`       | [Install GitHub CLI](https://cli.github.com/)             |
-| `--docker` fails              | Docker must be running: `docker ps` to verify             |
-| Cluster stuck                 | `zeroshot resume <id>` to continue                        |
-| Agent keeps failing           | Check `zeroshot logs <id>` for actual error               |
-| `zeroshot: command not found` | `npm install -g @covibes/zeroshot`                        |
-| Agents misbehave              | Run `/analyze-cluster-postmortem <id>` in Claude Code     |
+| Issue                         | Fix                                                                                       |
+| ----------------------------- | ----------------------------------------------------------------------------------------- |
+| `claude: command not found`   | `npm i -g @anthropic-ai/claude-code && claude auth login`                                 |
+| `codex: command not found`    | `npm i -g @openai/codex && codex login`                                                   |
+| `gemini: command not found`   | `npm i -g @google/gemini-cli && gemini auth login`                                        |
+| `gh: command not found`       | [Install GitHub CLI](https://cli.github.com/)                                             |
+| `--docker` fails              | Docker must be running: `docker ps` to verify                                             |
+| Cluster stuck                 | `zeroshot resume <id>` to continue                                                        |
+| Agent keeps failing           | Check `zeroshot logs <id>` for actual error                                               |
+| `zeroshot: command not found` | `npm install -g @covibes/zeroshot`                                                        |
+| Agents misbehave              | `/analyze-cluster-postmortem <id>` in Claude Code (creates issue if fix is generalizable) |
 
 </details>
 
