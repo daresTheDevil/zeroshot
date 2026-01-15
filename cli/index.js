@@ -227,45 +227,102 @@ function getOrchestrator() {
 function readAgentTaskLogs(cluster) {
   /** @type {TaskLogMessage[]} */
   const messages = [];
-  const zeroshotLogsDir = path.join(os.homedir(), '.claude-zeroshot', 'logs');
+  const zeroshotLogsDir = getZeroshotLogsDir();
 
   if (!fs.existsSync(zeroshotLogsDir)) {
     return messages;
   }
 
-  // Strategy 1: Find task IDs from AGENT_LIFECYCLE messages
   const lifecycleMessages = cluster.messageBus.query({
     cluster_id: cluster.id,
     topic: 'AGENT_LIFECYCLE',
   });
 
-  const taskIds = new Set(); // All task IDs we've found
+  const taskIds = collectTaskIds(cluster, lifecycleMessages, zeroshotLogsDir);
+
+  for (const taskId of taskIds) {
+    const logPath = path.join(zeroshotLogsDir, `${taskId}.log`);
+    const lines = readTaskLogLines(taskId, logPath);
+    if (!lines || lines.length === 0) {
+      continue;
+    }
+
+    const agent = resolveAgentForTask(cluster, taskId, lifecycleMessages);
+    if (!agent) {
+      continue;
+    }
+
+    const state = agent.getState();
+    for (const line of lines) {
+      const parsed = parseTaskLogLine(line);
+      if (!parsed) {
+        continue;
+      }
+      messages.push(
+        buildTaskLogMessage({
+          taskId,
+          timestamp: parsed.timestamp,
+          jsonContent: parsed.jsonContent,
+          cluster,
+          agent,
+          iteration: state.iteration,
+        })
+      );
+    }
+  }
+
+  return messages;
+}
+
+function getZeroshotLogsDir() {
+  return path.join(os.homedir(), '.claude-zeroshot', 'logs');
+}
+
+function collectTaskIds(cluster, lifecycleMessages, logsDir) {
+  const taskIds = new Set();
+  addTaskIds(taskIds, collectTaskIdsFromLifecycle(lifecycleMessages));
+  addTaskIds(taskIds, collectTaskIdsFromAgents(cluster.agents));
+  addTaskIds(taskIds, collectTaskIdsFromLogFiles(logsDir, cluster.createdAt));
+  return taskIds;
+}
+
+function addTaskIds(target, ids) {
+  for (const id of ids) {
+    target.add(id);
+  }
+}
+
+function collectTaskIdsFromLifecycle(lifecycleMessages) {
+  const taskIds = new Set();
   for (const msg of lifecycleMessages) {
     const taskId = msg.content?.data?.taskId;
     if (taskId) {
       taskIds.add(taskId);
     }
   }
+  return taskIds;
+}
 
-  // Strategy 2: Find task IDs from current agent state
-  for (const agent of cluster.agents) {
+function collectTaskIdsFromAgents(agents) {
+  const taskIds = new Set();
+  for (const agent of agents) {
     const state = agent.getState();
     if (state.currentTaskId) {
       taskIds.add(state.currentTaskId);
     }
   }
+  return taskIds;
+}
 
-  // Strategy 3: Scan for log files matching cluster start time (catch orphaned tasks)
-  // This handles the case where TASK_ID_ASSIGNED wasn't published to cluster DB
-  const clusterStartTime = cluster.createdAt;
-  const logFiles = fs.readdirSync(zeroshotLogsDir);
-
+function collectTaskIdsFromLogFiles(logsDir, clusterStartTime) {
+  const taskIds = new Set();
+  const logFiles = fs.readdirSync(logsDir);
   for (const logFile of logFiles) {
-    if (!logFile.endsWith('.log')) continue;
+    if (!logFile.endsWith('.log')) {
+      continue;
+    }
     const taskId = logFile.replace(/\.log$/, '');
-
-    // Check file modification time - only include logs modified after cluster started
-    const logPath = path.join(zeroshotLogsDir, logFile);
+    const logPath = path.join(logsDir, logFile);
     try {
       const stats = fs.statSync(logPath);
       if (stats.mtimeMs >= clusterStartTime) {
@@ -275,109 +332,106 @@ function readAgentTaskLogs(cluster) {
       // Skip files we can't stat
     }
   }
+  return taskIds;
+}
 
-  // Read logs for all discovered tasks
-  for (const taskId of taskIds) {
-    const logPath = path.join(zeroshotLogsDir, `${taskId}.log`);
-    if (!fs.existsSync(logPath)) {
-      continue;
-    }
+function readTaskLogLines(taskId, logPath) {
+  if (!fs.existsSync(logPath)) {
+    return null;
+  }
+  try {
+    const content = fs.readFileSync(logPath, 'utf8');
+    return content.split('\n').filter((line) => line.trim());
+  } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
+    console.warn(`Warning: Could not read log for ${taskId}: ${errMessage}`);
+    return null;
+  }
+}
 
-    try {
-      const content = fs.readFileSync(logPath, 'utf8');
-      const lines = content.split('\n').filter((line) => line.trim());
+function resolveAgentForTask(cluster, taskId, lifecycleMessages) {
+  const directMatch = findAgentByTaskId(cluster.agents, taskId);
+  if (directMatch) {
+    return directMatch;
+  }
+  const inferredMatch = findAgentFromLifecycle(cluster.agents, taskId, lifecycleMessages);
+  return inferredMatch || cluster.agents[0] || null;
+}
 
-      // Try to match task to agent (best effort, may not find a match for orphaned tasks)
-      let matchedAgent = null;
-      for (const agent of cluster.agents) {
-        const state = agent.getState();
-        if (state.currentTaskId === taskId) {
-          matchedAgent = agent;
-          break;
-        }
-      }
-
-      // If no agent match, try to infer from lifecycle messages
-      if (!matchedAgent) {
-        for (const msg of lifecycleMessages) {
-          if (msg.content?.data?.taskId === taskId) {
-            const agentId = msg.content?.data?.agent || msg.sender;
-            matchedAgent = cluster.agents.find((a) => a.id === agentId);
-            break;
-          }
-        }
-      }
-
-      // Default to first agent if no match found (best effort for orphaned tasks)
-      const agent = matchedAgent || cluster.agents[0];
-      if (!agent) {
-        continue;
-      }
-
-      const state = agent.getState();
-
-      for (const line of lines) {
-        // Lines are prefixed with [timestamp] - parse that first
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('[')) {
-          continue;
-        }
-
-        try {
-          // Parse timestamp-prefixed line: [1733301234567]{json...} or [1733301234567][SYSTEM]...
-          let timestamp = Date.now();
-          let jsonContent = trimmed;
-
-          const timestampMatch = jsonContent.match(/^\[(\d{13})\](.*)$/);
-          if (timestampMatch) {
-            timestamp = parseInt(timestampMatch[1], 10);
-            jsonContent = timestampMatch[2];
-          }
-
-          // Skip non-JSON (e.g., [SYSTEM] lines)
-          if (!jsonContent.startsWith('{')) {
-            continue;
-          }
-
-          // Parse JSON
-          const parsed = JSON.parse(jsonContent);
-
-          // Skip system init messages
-          if (parsed.type === 'system' && parsed.subtype === 'init') {
-            continue;
-          }
-
-          // Convert to cluster message format
-          messages.push({
-            id: `task-${taskId}-${timestamp}`,
-            timestamp,
-            topic: 'AGENT_OUTPUT',
-            sender: agent.id,
-            receiver: 'broadcast',
-            cluster_id: cluster.id,
-            content: {
-              text: jsonContent,
-              data: {
-                type: 'stdout',
-                line: jsonContent,
-                agent: agent.id,
-                role: agent.role,
-                iteration: state.iteration,
-                fromTaskLog: true, // Mark as coming from task log
-              },
-            },
-          });
-        } catch {
-          // Skip invalid JSON
-        }
-      }
-    } catch (err) {
-      // Log file read error - skip this task
-      console.warn(`Warning: Could not read log for ${taskId}: ${err.message}`);
+function findAgentByTaskId(agents, taskId) {
+  for (const agent of agents) {
+    const state = agent.getState();
+    if (state.currentTaskId === taskId) {
+      return agent;
     }
   }
+  return null;
+}
 
-  return messages;
+function findAgentFromLifecycle(agents, taskId, lifecycleMessages) {
+  for (const msg of lifecycleMessages) {
+    if (msg.content?.data?.taskId === taskId) {
+      const agentId = msg.content?.data?.agent || msg.sender;
+      return agents.find((agent) => agent.id === agentId) || null;
+    }
+  }
+  return null;
+}
+
+function parseTaskLogLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('[')) {
+    return null;
+  }
+
+  const parsed = parseTimestampedLine(trimmed);
+  if (!parsed.jsonContent.startsWith('{')) {
+    return null;
+  }
+
+  try {
+    const json = JSON.parse(parsed.jsonContent);
+    if (json.type === 'system' && json.subtype === 'init') {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return parsed;
+}
+
+function parseTimestampedLine(line) {
+  const timestampMatch = line.match(/^\[(\d{13})\](.*)$/);
+  if (!timestampMatch) {
+    return { timestamp: Date.now(), jsonContent: line };
+  }
+  return {
+    timestamp: parseInt(timestampMatch[1], 10),
+    jsonContent: timestampMatch[2],
+  };
+}
+
+function buildTaskLogMessage({ taskId, timestamp, jsonContent, cluster, agent, iteration }) {
+  return {
+    id: `task-${taskId}-${timestamp}`,
+    timestamp,
+    topic: 'AGENT_OUTPUT',
+    sender: agent.id,
+    receiver: 'broadcast',
+    cluster_id: cluster.id,
+    content: {
+      text: jsonContent,
+      data: {
+        type: 'stdout',
+        line: jsonContent,
+        agent: agent.id,
+        role: agent.role,
+        iteration,
+        fromTaskLog: true,
+      },
+    },
+  };
 }
 
 // Setup shell completion
