@@ -255,8 +255,37 @@ class Orchestrator {
     const messageBus = new MessageBus(ledger);
 
     // Restore isolation manager FIRST if cluster was running in isolation mode
+    const { isolation, isolationManager } = this._restoreClusterIsolation(clusterId, clusterData);
+
+    // Reconstruct agent metadata from config (processes are ephemeral)
+    // CRITICAL: Pass isolation context to agents if cluster was running in isolation
+    const agents = this._rebuildClusterAgents(
+      clusterId,
+      clusterData,
+      messageBus,
+      isolation,
+      isolationManager
+    );
+
+    const cluster = {
+      ...clusterData,
+      ledger,
+      messageBus,
+      agents,
+      isolation,
+      autoPr: clusterData.autoPr || false,
+    };
+
+    this.clusters.set(clusterId, cluster);
+    this._log(`[Orchestrator] Loaded cluster: ${clusterId} with ${agents.length} agents`);
+
+    return cluster;
+  }
+
+  _restoreClusterIsolation(clusterId, clusterData) {
     let isolation = clusterData.isolation || null;
     let isolationManager = null;
+
     if (isolation?.enabled && isolation.containerId) {
       isolationManager = new IsolationManager({ image: isolation.image });
       // Restore the container mapping so cleanup works
@@ -277,80 +306,84 @@ class Orchestrator {
       );
     }
 
-    // Reconstruct agent metadata from config (processes are ephemeral)
-    // CRITICAL: Pass isolation context to agents if cluster was running in isolation
-    const agents = [];
+    return { isolation, isolationManager };
+  }
 
-    // CRITICAL: Determine the correct cwd for agents (worktree > isolation > saved cwd)
-    // This fixes clusters saved before the cwd injection bug was fixed
+  _resolveAgentCwd(clusterData) {
     const worktreePath = clusterData.worktree?.path;
     const isolationWorkDir = clusterData.isolation?.workDir;
-    const agentCwd = worktreePath || isolationWorkDir || null;
+    return worktreePath || isolationWorkDir || null;
+  }
 
-    if (clusterData.config?.agents) {
-      for (const agentConfig of clusterData.config.agents) {
-        // Fix agents that were saved without cwd (pre-bugfix clusters)
-        if (!agentConfig.cwd && agentCwd) {
-          agentConfig.cwd = agentCwd;
-          this._log(`[Orchestrator] Fixed missing cwd for agent ${agentConfig.id}: ${agentCwd}`);
-        }
-
-        if (clusterData.modelOverride) {
-          applyModelOverride(agentConfig, clusterData.modelOverride);
-        }
-
-        const agentOptions = {
-          id: clusterId,
-          quiet: this.quiet,
-          modelOverride: clusterData.modelOverride || null,
-        };
-
-        // Inject isolation context if enabled (MUST be done during agent creation)
-        if (isolation?.enabled && isolationManager) {
-          agentOptions.isolation = {
-            enabled: true,
-            manager: isolationManager,
-            clusterId,
-          };
-        }
-
-        // Create agent or subcluster wrapper based on type
-        let agent;
-        if (agentConfig.type === 'subcluster') {
-          agent = new SubClusterWrapper(agentConfig, messageBus, { id: clusterId }, agentOptions);
-        } else {
-          agent = new AgentWrapper(agentConfig, messageBus, { id: clusterId }, agentOptions);
-        }
-
-        // Restore agent runtime state if available (for accurate status display)
-        if (clusterData.agentStates) {
-          const savedState = clusterData.agentStates.find((s) => s.id === agentConfig.id);
-          if (savedState) {
-            agent.state = savedState.state || 'idle';
-            agent.iteration = savedState.iteration || 0;
-            agent.currentTask = savedState.currentTask || false;
-            agent.currentTaskId = savedState.currentTaskId || null;
-            agent.processPid = savedState.processPid || null;
-          }
-        }
-
-        agents.push(agent);
-      }
-    }
-
-    const cluster = {
-      ...clusterData,
-      ledger,
-      messageBus,
-      agents,
-      isolation,
-      autoPr: clusterData.autoPr || false,
+  _buildAgentOptions(clusterId, clusterData, isolation, isolationManager) {
+    const agentOptions = {
+      id: clusterId,
+      quiet: this.quiet,
+      modelOverride: clusterData.modelOverride || null,
     };
 
-    this.clusters.set(clusterId, cluster);
-    this._log(`[Orchestrator] Loaded cluster: ${clusterId} with ${agents.length} agents`);
+    if (isolation?.enabled && isolationManager) {
+      agentOptions.isolation = {
+        enabled: true,
+        manager: isolationManager,
+        clusterId,
+      };
+    }
 
-    return cluster;
+    return agentOptions;
+  }
+
+  _instantiateAgent(agentConfig, messageBus, clusterId, agentOptions) {
+    if (agentConfig.type === 'subcluster') {
+      return new SubClusterWrapper(agentConfig, messageBus, { id: clusterId }, agentOptions);
+    }
+
+    return new AgentWrapper(agentConfig, messageBus, { id: clusterId }, agentOptions);
+  }
+
+  _restoreAgentState(agent, agentConfig, clusterData) {
+    if (!clusterData.agentStates) return;
+
+    const savedState = clusterData.agentStates.find((state) => state.id === agentConfig.id);
+    if (!savedState) return;
+
+    agent.state = savedState.state || 'idle';
+    agent.iteration = savedState.iteration || 0;
+    agent.currentTask = savedState.currentTask || false;
+    agent.currentTaskId = savedState.currentTaskId || null;
+    agent.processPid = savedState.processPid || null;
+  }
+
+  _rebuildClusterAgents(clusterId, clusterData, messageBus, isolation, isolationManager) {
+    const agents = [];
+    const agentCwd = this._resolveAgentCwd(clusterData);
+
+    if (!clusterData.config?.agents) {
+      return agents;
+    }
+
+    for (const agentConfig of clusterData.config.agents) {
+      if (!agentConfig.cwd && agentCwd) {
+        agentConfig.cwd = agentCwd;
+        this._log(`[Orchestrator] Fixed missing cwd for agent ${agentConfig.id}: ${agentCwd}`);
+      }
+
+      if (clusterData.modelOverride) {
+        applyModelOverride(agentConfig, clusterData.modelOverride);
+      }
+
+      const agentOptions = this._buildAgentOptions(
+        clusterId,
+        clusterData,
+        isolation,
+        isolationManager
+      );
+      const agent = this._instantiateAgent(agentConfig, messageBus, clusterId, agentOptions);
+      this._restoreAgentState(agent, agentConfig, clusterData);
+      agents.push(agent);
+    }
+
+    return agents;
   }
 
   /**
