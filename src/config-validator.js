@@ -117,6 +117,100 @@ function validateConfig(config, depth = 0) {
   };
 }
 
+function validateAgentIdentity(agent, prefix, seenIds, errors) {
+  if (!agent.id) {
+    errors.push(`${prefix}.id is required`);
+  } else if (typeof agent.id !== 'string') {
+    errors.push(`${prefix}.id must be a string`);
+  } else if (seenIds.has(agent.id)) {
+    errors.push(`Duplicate agent id: "${agent.id}"`);
+  } else {
+    seenIds.add(agent.id);
+  }
+
+  if (!agent.role) {
+    errors.push(`${prefix}.role is required`);
+  }
+}
+
+function validateSubclusterAgent(agent, depth, errors, warnings) {
+  const subClusterSchema = require('./schemas/sub-cluster');
+  const subResult = subClusterSchema.validateSubCluster(agent, depth);
+  errors.push(...subResult.errors);
+  warnings.push(...subResult.warnings);
+}
+
+function validateTrigger(trigger, triggerPrefix, errors) {
+  if (!trigger.topic) {
+    errors.push(`${triggerPrefix}.topic is required`);
+  }
+
+  if (trigger.action && !['execute_task', 'stop_cluster'].includes(trigger.action)) {
+    errors.push(
+      `${triggerPrefix}.action must be 'execute_task' or 'stop_cluster', got '${trigger.action}'`
+    );
+  }
+
+  if (trigger.logic) {
+    if (!trigger.logic.script) {
+      errors.push(`${triggerPrefix}.logic.script is required when logic is specified`);
+    }
+    if (trigger.logic.engine && trigger.logic.engine !== 'javascript') {
+      errors.push(
+        `${triggerPrefix}.logic.engine must be 'javascript', got '${trigger.logic.engine}'`
+      );
+    }
+  }
+}
+
+function validateAgentTriggers(agent, prefix, errors) {
+  if (!agent.triggers || !Array.isArray(agent.triggers)) {
+    errors.push(`${prefix}.triggers array is required`);
+    return;
+  }
+
+  if (agent.triggers.length === 0) {
+    errors.push(`${prefix}.triggers cannot be empty (agent would never activate)`);
+  }
+
+  for (let j = 0; j < agent.triggers.length; j++) {
+    const trigger = agent.triggers[j];
+    const triggerPrefix = `${prefix}.triggers[${j}]`;
+    validateTrigger(trigger, triggerPrefix, errors);
+  }
+}
+
+function validateModelRule(rule, rulePrefix, errors) {
+  if (!rule.iterations) {
+    errors.push(`${rulePrefix}.iterations is required`);
+  } else if (!isValidIterationPattern(rule.iterations)) {
+    errors.push(
+      `${rulePrefix}.iterations '${rule.iterations}' is invalid. Valid: "1", "1-3", "5+", "all"`
+    );
+  }
+
+  if (!rule.model && !rule.modelLevel) {
+    errors.push(`${rulePrefix}.model or modelLevel is required`);
+  }
+}
+
+function validateAgentModelRules(agent, prefix, errors) {
+  if (!agent.modelRules) {
+    return;
+  }
+
+  if (!Array.isArray(agent.modelRules)) {
+    errors.push(`${prefix}.modelRules must be an array`);
+    return;
+  }
+
+  for (let j = 0; j < agent.modelRules.length; j++) {
+    const rule = agent.modelRules[j];
+    const rulePrefix = `${prefix}.modelRules[${j}]`;
+    validateModelRule(rule, rulePrefix, errors);
+  }
+}
+
 /**
  * Phase 1: Validate basic structure (fields, types, duplicates)
  */
@@ -143,91 +237,21 @@ function validateBasicStructure(config, depth = 0) {
     // Check if this is a subcluster
     const isSubCluster = agent.type === 'subcluster';
 
-    // Required fields
-    if (!agent.id) {
-      errors.push(`${prefix}.id is required`);
-    } else if (typeof agent.id !== 'string') {
-      errors.push(`${prefix}.id must be a string`);
-    } else if (seenIds.has(agent.id)) {
-      errors.push(`Duplicate agent id: "${agent.id}"`);
-    } else {
-      seenIds.add(agent.id);
-    }
-
-    if (!agent.role) {
-      errors.push(`${prefix}.role is required`);
-    }
+    validateAgentIdentity(agent, prefix, seenIds, errors);
 
     // Validate subclusters
     if (isSubCluster) {
-      const subClusterSchema = require('./schemas/sub-cluster');
-      const subResult = subClusterSchema.validateSubCluster(agent, depth);
-      errors.push(...subResult.errors);
-      warnings.push(...subResult.warnings);
+      validateSubclusterAgent(agent, depth, errors, warnings);
       continue; // Skip regular agent validation
     }
 
     // Regular agent validation
-    if (!agent.triggers || !Array.isArray(agent.triggers)) {
-      errors.push(`${prefix}.triggers array is required`);
-    } else if (agent.triggers.length === 0) {
-      errors.push(`${prefix}.triggers cannot be empty (agent would never activate)`);
-    }
-
-    // Validate triggers structure
-    if (agent.triggers) {
-      for (let j = 0; j < agent.triggers.length; j++) {
-        const trigger = agent.triggers[j];
-        const triggerPrefix = `${prefix}.triggers[${j}]`;
-
-        if (!trigger.topic) {
-          errors.push(`${triggerPrefix}.topic is required`);
-        }
-
-        if (trigger.action && !['execute_task', 'stop_cluster'].includes(trigger.action)) {
-          errors.push(
-            `${triggerPrefix}.action must be 'execute_task' or 'stop_cluster', got '${trigger.action}'`
-          );
-        }
-
-        if (trigger.logic) {
-          if (!trigger.logic.script) {
-            errors.push(`${triggerPrefix}.logic.script is required when logic is specified`);
-          }
-          if (trigger.logic.engine && trigger.logic.engine !== 'javascript') {
-            errors.push(
-              `${triggerPrefix}.logic.engine must be 'javascript', got '${trigger.logic.engine}'`
-            );
-          }
-        }
-      }
-    }
+    validateAgentTriggers(agent, prefix, errors);
 
     // Validate model rules if present
-    if (agent.modelRules) {
-      if (!Array.isArray(agent.modelRules)) {
-        errors.push(`${prefix}.modelRules must be an array`);
-      } else {
-        for (let j = 0; j < agent.modelRules.length; j++) {
-          const rule = agent.modelRules[j];
-          const rulePrefix = `${prefix}.modelRules[${j}]`;
+    validateAgentModelRules(agent, prefix, errors);
 
-          if (!rule.iterations) {
-            errors.push(`${rulePrefix}.iterations is required`);
-          } else if (!isValidIterationPattern(rule.iterations)) {
-            errors.push(
-              `${rulePrefix}.iterations '${rule.iterations}' is invalid. Valid: "1", "1-3", "5+", "all"`
-            );
-          }
-
-          if (!rule.model && !rule.modelLevel) {
-            errors.push(`${rulePrefix}.model or modelLevel is required`);
-          }
-        }
-
-        // Note: Detailed coverage gap checking (iteration ranges) is done in Phase 7
-      }
-    }
+    // Note: Detailed coverage gap checking (iteration ranges) is done in Phase 7
   }
 
   return { errors, warnings };
