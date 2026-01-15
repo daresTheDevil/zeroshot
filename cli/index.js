@@ -4556,7 +4556,7 @@ function normalizeIssueList(rawIssues) {
   return [];
 }
 
-function appendCriteriaGroup(lines, prefix, label, items, color, reasonLabel) {
+function appendCriteriaGroup({ lines, prefix, label, items, color, reasonLabel }) {
   if (!items.length) return;
   lines.push(`${prefix}   ${color(label)} (${items.length} criteria - ${reasonLabel}):`);
   for (const item of items) {
@@ -4568,24 +4568,24 @@ function appendCriteriaResults(lines, prefix, criteriaResults) {
   if (!Array.isArray(criteriaResults)) return;
 
   const cannotValidateYet = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE_YET');
-  appendCriteriaGroup(
+  appendCriteriaGroup({
     lines,
     prefix,
-    '❌ Cannot validate yet',
-    cannotValidateYet,
-    chalk.red,
-    'work incomplete'
-  );
+    label: '❌ Cannot validate yet',
+    items: cannotValidateYet,
+    color: chalk.red,
+    reasonLabel: 'work incomplete',
+  });
 
   const cannotValidate = criteriaResults.filter((c) => c.status === 'CANNOT_VALIDATE');
-  appendCriteriaGroup(
+  appendCriteriaGroup({
     lines,
     prefix,
-    '⚠️ Could not validate',
-    cannotValidate,
-    chalk.yellow,
-    'permanent'
-  );
+    label: '⚠️ Could not validate',
+    items: cannotValidate,
+    color: chalk.yellow,
+    reasonLabel: 'permanent',
+  });
 }
 
 function handleValidationResultRender({ msg, prefix, timestamp, lines }) {
@@ -4649,7 +4649,7 @@ function appendAgentTextEvent(lines, sender, prefix, buffers, text) {
   }
 }
 
-function appendAgentToolCallEvent(lines, sender, prefix, buffers, toolCalls, event) {
+function appendAgentToolCallEvent({ lines, sender, prefix, buffers, toolCalls, event }) {
   flushRenderBuffer(buffers, sender, prefix, lines);
   const icon = getToolIcon(event.toolName);
   const toolDesc = formatToolCall(event.toolName, event.input);
@@ -4684,7 +4684,14 @@ function handleAgentOutputRender({ msg, prefix, lines, buffers, toolCalls }) {
       continue;
     }
     if (event.type === 'tool_call') {
-      appendAgentToolCallEvent(lines, msg.sender, prefix, buffers, toolCalls, event);
+      appendAgentToolCallEvent({
+        lines,
+        sender: msg.sender,
+        prefix,
+        buffers,
+        toolCalls,
+        event,
+      });
       continue;
     }
     if (event.type === 'tool_result') {
