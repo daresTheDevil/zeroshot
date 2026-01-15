@@ -5003,95 +5003,115 @@ const FILTERED_PATTERNS = [
   /\{\{[a-z.]+\}\}/,
 ];
 
-// Handle AGENT_OUTPUT messages (streaming events from agent task execution)
-function formatAgentOutput(msg, prefix) {
-  const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
-  if (!content || !content.trim()) return;
+function getAgentOutputContent(msg) {
+  return msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text || '';
+}
 
+function parseAgentOutputEvents(msg, content) {
   const provider = normalizeProviderName(
     msg.content?.data?.provider || msg.sender_provider || 'claude'
   );
-  const events = parseProviderChunk(provider, content);
+  return parseProviderChunk(provider, content);
+}
 
+function handleAgentOutputText({ msg, prefix, event }) {
+  accumulateText(prefix, msg.sender, event.text);
+}
+
+function handleAgentOutputThinking({ msg, prefix, event }) {
+  if (event.text) {
+    accumulateThinking(prefix, msg.sender, event.text);
+    return;
+  }
+  if (event.type === 'thinking_start') {
+    safePrint(`${prefix} ${chalk.dim.italic('💭 thinking...')}`);
+  }
+}
+
+function handleAgentOutputToolStart({ msg, prefix }) {
+  flushLineBuffer(prefix, msg.sender);
+}
+
+function handleAgentOutputToolCall({ msg, prefix, event }) {
+  flushLineBuffer(prefix, msg.sender);
+  const icon = getToolIcon(event.toolName);
+  const toolDesc = formatToolCall(event.toolName, event.input);
+  safePrint(`${prefix} ${icon} ${chalk.cyan(event.toolName)} ${chalk.dim(toolDesc)}`);
+  currentToolCall.set(msg.sender, { toolName: event.toolName, input: event.input });
+}
+
+function handleAgentOutputToolResult({ msg, prefix, event }) {
+  const status = event.isError ? chalk.red('✗') : chalk.green('✓');
+  const toolCall = currentToolCall.get(msg.sender);
+  const resultDesc = formatToolResult(
+    event.content,
+    event.isError,
+    toolCall?.toolName,
+    toolCall?.input
+  );
+  safePrint(`${prefix}   ${status} ${resultDesc}`);
+  currentToolCall.delete(msg.sender);
+}
+
+function handleAgentOutputResult({ msg, prefix, event }) {
+  flushLineBuffer(prefix, msg.sender);
+  if (!event.success) {
+    safePrint(`${prefix} ${chalk.bold.red('✗ Error:')} ${event.error || 'Task failed'}`);
+  }
+}
+
+function handleAgentOutputNoop() {}
+
+const AGENT_OUTPUT_EVENT_HANDLERS = {
+  text: handleAgentOutputText,
+  thinking: handleAgentOutputThinking,
+  thinking_start: handleAgentOutputThinking,
+  tool_start: handleAgentOutputToolStart,
+  tool_call: handleAgentOutputToolCall,
+  tool_input: handleAgentOutputNoop,
+  tool_result: handleAgentOutputToolResult,
+  result: handleAgentOutputResult,
+  block_end: handleAgentOutputNoop,
+};
+
+function isInlineJsonLine(trimmed) {
+  return (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  );
+}
+
+function shouldSkipAgentOutputLine(trimmed) {
+  if (!trimmed) return true;
+  if (FILTERED_PATTERNS.some((pattern) => pattern.test(trimmed))) return true;
+  if (isInlineJsonLine(trimmed)) return true;
+  return isDuplicate(trimmed);
+}
+
+function printFilteredAgentOutputLines(content, prefix) {
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (shouldSkipAgentOutputLine(trimmed)) continue;
+    safePrint(`${prefix} ${line}`);
+  }
+}
+
+// Handle AGENT_OUTPUT messages (streaming events from agent task execution)
+function formatAgentOutput(msg, prefix) {
+  const content = getAgentOutputContent(msg);
+  if (!content || !content.trim()) return;
+
+  const events = parseAgentOutputEvents(msg, content);
   for (const event of events) {
-    switch (event.type) {
-      case 'text':
-        accumulateText(prefix, msg.sender, event.text);
-        break;
-      case 'thinking':
-      case 'thinking_start':
-        if (event.text) {
-          accumulateThinking(prefix, msg.sender, event.text);
-        } else if (event.type === 'thinking_start') {
-          safePrint(`${prefix} ${chalk.dim.italic('💭 thinking...')}`);
-        }
-        break;
-      case 'tool_start':
-        flushLineBuffer(prefix, msg.sender);
-        break;
-      case 'tool_call':
-        flushLineBuffer(prefix, msg.sender);
-        const icon = getToolIcon(event.toolName);
-        const toolDesc = formatToolCall(event.toolName, event.input);
-        safePrint(`${prefix} ${icon} ${chalk.cyan(event.toolName)} ${chalk.dim(toolDesc)}`);
-        currentToolCall.set(msg.sender, {
-          toolName: event.toolName,
-          input: event.input,
-        });
-        break;
-      case 'tool_input':
-        break;
-      case 'tool_result': {
-        const status = event.isError ? chalk.red('✗') : chalk.green('✓');
-        const toolCall = currentToolCall.get(msg.sender);
-        const resultDesc = formatToolResult(
-          event.content,
-          event.isError,
-          toolCall?.toolName,
-          toolCall?.input
-        );
-        safePrint(`${prefix}   ${status} ${resultDesc}`);
-        currentToolCall.delete(msg.sender);
-        break;
-      }
-      case 'result':
-        flushLineBuffer(prefix, msg.sender);
-        if (!event.success) {
-          safePrint(`${prefix} ${chalk.bold.red('✗ Error:')} ${event.error || 'Task failed'}`);
-        }
-        break;
-      case 'block_end':
-        break;
-      default:
-        break;
+    const handler = AGENT_OUTPUT_EVENT_HANDLERS[event.type];
+    if (handler) {
+      handler({ msg, prefix, event });
     }
   }
 
   if (events.length === 0) {
-    const lines = content.split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      let shouldSkip = false;
-      for (const pattern of FILTERED_PATTERNS) {
-        if (pattern.test(trimmed)) {
-          shouldSkip = true;
-          break;
-        }
-      }
-      if (shouldSkip) continue;
-
-      if (
-        (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-        (trimmed.startsWith('[') && trimmed.endsWith(']'))
-      )
-        continue;
-
-      if (isDuplicate(trimmed)) continue;
-
-      safePrint(`${prefix} ${line}`);
-    }
+    printFilteredAgentOutputLines(content, prefix);
   }
 }
 
