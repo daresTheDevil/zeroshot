@@ -113,7 +113,7 @@ Agent A -> publish() -> SQLite Ledger -> LogicEngine -> trigger match -> Agent B
 - Set `provider` per agent or `defaultProvider`/`forceProvider` at cluster level.
 - Provider names use CLI identifiers: `claude`, `codex`, `gemini` (legacy `anthropic`/`openai`/`google` map to these).
 - `model` remains a provider-specific escape hatch.
-- Codex-only: `reasoningEffort` (`low|medium|high|xhigh`).
+- Codex/Opencode only: `reasoningEffort` (`low|medium|high|xhigh`).
 
 ### Logic Script API
 
@@ -171,7 +171,7 @@ Configurable credential mounts for `--docker` mode. See `lib/docker-config.js`.
 | `dockerEnvPassthrough` | `string[]`    | `[]`     | Extra env vars (supports `VAR`, `VAR_*`, `VAR=value`) |
 | `dockerContainerHome`  | `string`      | `/root`  | Container home for `$HOME` expansion                  |
 
-Mount presets: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`, `claude`, `codex`, `gemini`.
+Mount presets: `gh`, `git`, `ssh`, `aws`, `azure`, `kube`, `terraform`, `gcloud`, `claude`, `codex`, `gemini`, `opencode`.
 
 Provider CLIs in Docker require credential mounts; Zeroshot warns when missing.
 
@@ -219,6 +219,20 @@ Clusters survive crashes. Resume: `zeroshot resume <id>`.
 Bash subprocess output not streamed: Claude CLI returns `tool_result` after subprocess completes.
 Long scripts show no output until done.
 
+### Kubernetes / Network Storage (SQLite Ledger)
+
+Zeroshot’s message ledger is SQLite (`~/.zeroshot/<id>.db`). On Kubernetes, putting this on a
+network filesystem (EFS/NFS/CephFS) can cause severe latency and lock contention.
+
+Mitigations (env vars):
+
+- `ZEROSHOT_SQLITE_JOURNAL_MODE=DELETE` (or `TRUNCATE`) for network filesystems that don’t like WAL
+- `ZEROSHOT_SQLITE_WAL_AUTOCHECKPOINT_PAGES=1000` (default) to avoid per-write checkpoint storms
+- `ZEROSHOT_SQLITE_BUSY_TIMEOUT_MS=5000` (default) to reduce `SQLITE_BUSY` flakiness under contention
+
+Operational rule: don’t run multiple pods against the same `~/.zeroshot` volume unless you
+really know what you’re doing—SQLite is not a multi-writer, multi-node database.
+
 ## Fixed Bugs (Reference)
 
 ### Template Agent CWD Injection (2026-01-03)
@@ -232,6 +246,18 @@ later via conductor classification missed it.
 
 Fix: added cwd injection to `_opAddAgents()` and resume path in `orchestrator.js`.
 Test: `tests/worktree-cwd-injection.test.js`.
+
+### PR Mode Completion Hang (2026-01-15)
+
+Bug: PR-mode clusters stayed running after PR creation/merge because no
+`CLUSTER_COMPLETE` was ever published.
+
+Root cause: `git-pusher` relied on `output.publishAfter` without an onComplete
+hook, so the orchestrator never received the completion signal.
+
+Fix: added `onComplete` publish of `CLUSTER_COMPLETE` in
+`src/agents/git-pusher-agent.json`.
+Test: `tests/integration/orchestrator-flow.test.js`.
 
 ## Enforcement Philosophy
 

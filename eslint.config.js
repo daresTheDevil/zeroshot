@@ -77,8 +77,23 @@ export default [
       'no-restricted-syntax': [
         'error',
         {
-          selector: "LogicalExpression[operator='||'][right.value=/localhost|127\\.0\\.0|^\\d{4,5}$/]",
+          selector:
+            "LogicalExpression[operator='||'][right.value=/localhost|127\\.0\\.0|^\\d{4,5}$/]",
           message: 'FORBIDDEN: Dangerous fallback. Throw error if missing instead.',
+        },
+        {
+          // Catches: const { exec } = require('child_process')
+          selector:
+            "VariableDeclarator[init.callee.name='require'][init.arguments.0.value='child_process'] > ObjectPattern > Property[key.name='exec']",
+          message:
+            "FORBIDDEN: Direct exec() from child_process can hang forever. Use require('./lib/safe-exec') instead.",
+        },
+        {
+          // Catches: const { execSync } = require('child_process')
+          selector:
+            "VariableDeclarator[init.callee.name='require'][init.arguments.0.value='child_process'] > ObjectPattern > Property[key.name='execSync']",
+          message:
+            "FORBIDDEN: Direct execSync() from child_process can hang forever. Use require('./lib/safe-exec') instead.",
         },
       ],
 
@@ -98,6 +113,25 @@ export default [
         beforeEach: 'readonly',
         afterEach: 'readonly',
       },
+    },
+  },
+  {
+    // Allow direct child_process in safe-exec wrapper, tests, CLI, and lib/
+    // - safe-exec.js: IS the wrapper
+    // - tests/: Need to test subprocess behavior directly
+    // - cli/: Has its own timeout handling for user-facing commands
+    // - lib/: Utility code with specific timeout requirements
+    files: ['src/lib/safe-exec.js', 'tests/**/*.js', 'cli/**/*.js', 'lib/**/*.js'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        // Keep the dangerous fallback rule, just disable the exec rule
+        {
+          selector:
+            "LogicalExpression[operator='||'][right.value=/localhost|127\\.0\\.0|^\\d{4,5}$/]",
+          message: 'FORBIDDEN: Dangerous fallback. Throw error if missing instead.',
+        },
+      ],
     },
   },
   {

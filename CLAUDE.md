@@ -19,6 +19,22 @@ Message-passing primitives for multi-agent workflows. **Install:** `npm i -g @co
 
 **Destructive (needs permission):** `zeroshot kill`, `zeroshot clear`, `zeroshot purge`
 
+## 🔴 BEHAVIORAL STANDARDS
+
+```
+WHEN USER POSTS LOGS → THERE IS A BUG. INVESTIGATE.
+WHEN TESTS FAIL → Test is source of truth unless PROVEN otherwise.
+TEST BEHAVIOR, NOT IMPLEMENTATION. TESTS FIND BUGS, NOT PASS.
+READ THE STACK TRACE. FIX ROOT CAUSE, NOT SYMPTOM.
+FAIL FAST. Silent failures are worst. Errors > Warnings.
+VERIFY ASSUMPTIONS. Don't assume - check.
+BUILD WHAT WAS ASKED. Not what you think should be built.
+DON'T OVERENGINEER. No abstractions before they're needed.
+DON'T REINVENT. Read existing code before writing new.
+DON'T SWALLOW ERRORS. Try/catch that ignores = hidden bugs.
+IS THIS HOW A SENIOR STAFF ARCHITECT WOULD DO IT? ACT LIKE ONE.
+```
+
 ## Where to Look
 
 | Concept                  | File                                |
@@ -324,7 +340,48 @@ const maxValidators = cluster.config.complexity === 'CRITICAL' ? 5 : 3;
 
 ## 🔴 BEHAVIORAL RULES
 
-### Git Workflow (Multi-Agent Context)
+### Git Workflow (Contributing to Zeroshot)
+
+**Merge queue enforces CI on rebased code before merge.**
+
+```
+feature-branch (local)
+↓
+pre-push hook → lint + typecheck (~5s)
+↓
+push to origin/feature-branch
+↓
+gh pr create --base dev
+↓
+CI runs tests on PR branch
+↓
+gh pr merge --auto --squash → enters merge queue
+↓
+Queue rebases PR on latest dev + runs CI again
+↓
+Merge to dev (only if CI passes on rebased code)
+```
+
+**Pre-push hook blocks:** Direct pushes to `main` or `dev`. Must use PR workflow.
+
+**Commands:**
+
+```bash
+# Feature work
+git switch -c feat/my-feature
+# ... make changes ...
+git push -u origin feat/my-feature
+gh pr create --base dev
+gh pr merge --auto --squash
+
+# Release (dev → main)
+gh pr create --base main --head dev --title "Release"
+# → CI passes → merge → semantic-release publishes
+```
+
+**Setup merge queue (admin):** `./scripts/setup-merge-queue.sh`
+
+### Git Safety (Multi-Agent Context)
 
 **CRITICAL: Use WIP commits instead of stashing:**
 
@@ -438,11 +495,95 @@ npm run typecheck         # TypeScript (if applicable)
 
 ## Mechanical Enforcement
 
-| Antipattern               | Enforcement               |
-| ------------------------- | ------------------------- |
-| Dangerous fallbacks       | ESLint ERROR              |
-| Manual git tags           | Pre-push hook             |
-| Git in validator prompts  | Config validator          |
-| Multiple impl files (-v2) | Pre-commit hook           |
-| Spawn without permission  | Runtime check (CLI)       |
-| Git stash usage           | Pre-commit hook (planned) |
+| Antipattern               | Enforcement                              |
+| ------------------------- | ---------------------------------------- |
+| Dangerous fallbacks       | ESLint ERROR                             |
+| Manual git tags           | Pre-push hook                            |
+| Direct push to main/dev   | Pre-push hook (blocks with instructions) |
+| Git in validator prompts  | Config validator                         |
+| Multiple impl files (-v2) | Pre-commit hook                          |
+| Spawn without permission  | Runtime check (CLI)                      |
+| Git stash usage           | Pre-commit hook (planned)                |
+| Merge without CI rebase   | GitHub merge queue                       |
+
+## 🔴 NODE.JS PATTERNS (Zeroshot-Specific)
+
+### Async/Promises
+
+| Pattern                          | Why                                               |
+| -------------------------------- | ------------------------------------------------- |
+| ALWAYS await async functions     | Missing await = silent failure, unhandled Promise |
+| NEVER swallow Promise rejections | Unhandled rejection = process crash in Node 15+   |
+| Handle Promise.all failures      | One rejection = entire Promise.all rejects        |
+
+```javascript
+// ❌ WRONG - Missing await
+async function process() {
+  doAsyncThing(); // Returns immediately, error lost
+}
+
+// ✅ CORRECT
+async function process() {
+  await doAsyncThing();
+}
+
+// ❌ WRONG - Swallowed rejection
+try {
+  await riskyOperation();
+} catch (e) {
+  // Silent - bug hidden
+}
+
+// ✅ CORRECT
+try {
+  await riskyOperation();
+} catch (e) {
+  logger.error('Operation failed', { error: e });
+  throw e; // Re-throw or handle explicitly
+}
+```
+
+### Process/Signals (CLI-specific)
+
+| Pattern                  | Why                                                      |
+| ------------------------ | -------------------------------------------------------- |
+| Clean up child processes | Orphaned processes = resource leaks, port conflicts      |
+| Handle SIGTERM/SIGINT    | Users will Ctrl+C. Handle gracefully.                    |
+| Exit codes matter        | 0 = success, non-zero = failure. Scripts depend on this. |
+
+```javascript
+// ✅ CORRECT - Signal handling
+process.on('SIGTERM', async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  await cleanup();
+  process.exit(0);
+});
+
+// ✅ CORRECT - Child process cleanup
+const child = spawn('command');
+process.on('exit', () => child.kill());
+```
+
+### Multi-Agent Constraints
+
+| Pattern                   | Why                                                   |
+| ------------------------- | ----------------------------------------------------- |
+| No global mutable state   | Agents run in parallel. Globals = race conditions.    |
+| Never block on user input | Agents are non-interactive. Blocking = stuck forever. |
+
+## 🔴 JUNIOR MISTAKES (Don't Do These)
+
+| Mistake                | Why It's Wrong                              |
+| ---------------------- | ------------------------------------------- |
+| Overengineering        | No abstraction layers before they're needed |
+| Copy-paste coding      | If duplicating, you should be abstracting   |
+| Gold plating           | No features nobody asked for                |
+| Premature optimization | Measure first, optimize second              |
+| Reinventing            | Read existing code before writing new       |
+| Leaving edge cases     | Incomplete solutions are not solutions      |
+| Assuming it works      | Test it. Verify it. Prove it.               |
+| Catch-and-ignore       | Try/catch that swallows = hidden bugs       |

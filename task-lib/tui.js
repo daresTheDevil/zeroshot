@@ -31,38 +31,80 @@ function parseLogLine(line) {
   }
 
   // Parse JSON and extract relevant info
-  try {
-    const event = JSON.parse(trimmed);
+  const event = safeParseEvent(trimmed);
+  if (!event) {
+    return '';
+  }
 
-    // Extract text from content_block_delta
-    if (event.type === 'stream_event' && event.event?.type === 'content_block_delta') {
-      return event.event?.delta?.text || '';
-    }
-    // Extract tool use info
-    else if (event.type === 'stream_event' && event.event?.type === 'content_block_start') {
-      const block = event.event?.content_block;
-      if (block?.type === 'tool_use' && block?.name) {
-        return `\n[Tool: ${block.name}]\n`;
-      }
-    }
-    // Extract assistant messages
-    else if (event.type === 'assistant' && event.message?.content) {
-      let output = '';
-      for (const content of event.message.content) {
-        if (content.type === 'text') {
-          output += content.text;
-        }
-      }
-      return output;
-    }
-    // Extract final result
-    else if (event.type === 'result') {
-      if (event.is_error) {
-        return `\n[ERROR] ${event.result || 'Unknown error'}\n`;
-      }
-    }
+  return extractEventText(event);
+}
+
+function safeParseEvent(trimmed) {
+  try {
+    return JSON.parse(trimmed);
   } catch {
-    // Not JSON or parse error - skip
+    return null;
+  }
+}
+
+function extractEventText(event) {
+  if (event.type === 'stream_event') {
+    return extractStreamEventText(event);
+  }
+
+  if (event.type === 'assistant') {
+    return extractAssistantText(event);
+  }
+
+  if (event.type === 'result') {
+    return extractResultText(event);
+  }
+
+  return '';
+}
+
+function extractStreamEventText(event) {
+  const eventType = event.event?.type;
+
+  if (eventType === 'content_block_delta') {
+    return event.event?.delta?.text || '';
+  }
+
+  if (eventType === 'content_block_start') {
+    return extractToolUseText(event.event?.content_block);
+  }
+
+  return '';
+}
+
+function extractToolUseText(block) {
+  if (block?.type === 'tool_use' && block?.name) {
+    return `\n[Tool: ${block.name}]\n`;
+  }
+
+  return '';
+}
+
+function extractAssistantText(event) {
+  const contentBlocks = event.message?.content;
+
+  if (!Array.isArray(contentBlocks)) {
+    return '';
+  }
+
+  let output = '';
+  for (const content of contentBlocks) {
+    if (content.type === 'text') {
+      output += content.text;
+    }
+  }
+
+  return output;
+}
+
+function extractResultText(event) {
+  if (event.is_error) {
+    return `\n[ERROR] ${event.result || 'Unknown error'}\n`;
   }
 
   return '';

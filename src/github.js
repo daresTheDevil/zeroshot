@@ -7,7 +7,7 @@
  * - Fallback to plain text input
  */
 
-const { execSync } = require('child_process');
+const { execSync } = require('./lib/safe-exec'); // Enforces timeouts
 const fs = require('fs');
 const path = require('path');
 

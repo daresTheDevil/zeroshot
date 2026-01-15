@@ -23,7 +23,7 @@
  * Threshold: stuckScore >= 3.5 = likely stuck
  */
 
-const { execSync } = require('child_process');
+const { execSync } = require('../lib/safe-exec'); // Enforces timeouts
 const fs = require('fs');
 
 // Stuck detection thresholds
