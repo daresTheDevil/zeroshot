@@ -3259,26 +3259,105 @@ program
 // Settings management
 const settingsCmd = program.command('settings').description('Manage zeroshot settings');
 
-/**
- * Format settings list with grouped Docker configuration
- * Docker mounts shown as expanded table instead of raw JSON
- */
-function formatSettingsList(settings, showUsage = false) {
-  const DOCKER_KEYS = ['dockerMounts', 'dockerEnvPassthrough', 'dockerContainerHome'];
+function printSettingsUsage() {
+  console.log(chalk.dim('Usage:'));
+  console.log(chalk.dim('  zeroshot settings set <key> <value>'));
+  console.log(chalk.dim('  zeroshot settings get <key>'));
+  console.log(chalk.dim('  zeroshot settings reset'));
+  console.log('');
+  console.log(chalk.dim('Examples:'));
+  console.log(chalk.dim('  zeroshot settings set maxModel opus'));
+  console.log(chalk.dim('  zeroshot settings set dockerMounts \'["gh","git","ssh","aws"]\''));
+  console.log(chalk.dim('  zeroshot settings set dockerEnvPassthrough \'["AWS_*","TF_VAR_*"]\''));
+  console.log('');
+  console.log(
+    chalk.dim(
+      'Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud, claude, codex, gemini'
+    )
+  );
+  console.log('');
+}
 
-  console.log(chalk.bold('\nSettings:\n'));
-
-  // Non-docker settings first
+function printNonDockerSettings(settings) {
+  const dockerKeys = new Set(['dockerMounts', 'dockerEnvPassthrough', 'dockerContainerHome']);
   for (const [key, value] of Object.entries(settings)) {
-    if (DOCKER_KEYS.includes(key)) continue;
-
+    if (dockerKeys.has(key)) {
+      continue;
+    }
     const isDefault = JSON.stringify(DEFAULT_SETTINGS[key]) === JSON.stringify(value);
     const label = isDefault ? chalk.dim(key) : chalk.cyan(key);
     const val = isDefault ? chalk.dim(String(value)) : chalk.white(String(value));
     console.log(`  ${label.padEnd(30)} ${val}`);
   }
+}
 
-  // Docker configuration section (collapsible/grouped)
+function printPresetMountRow(mountName, preset, containerHome) {
+  if (!preset) {
+    console.log(`      ${chalk.red(mountName.padEnd(10))} ${chalk.red('(unknown preset)')}`);
+    return;
+  }
+  const container = preset.container.replace(/\$HOME/g, containerHome);
+  const rwFlag = preset.readonly ? chalk.dim('ro') : chalk.green('rw');
+  console.log(
+    `      ${chalk.cyan(mountName.padEnd(10))} ${chalk.dim(preset.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
+  );
+}
+
+function printCustomMountRow(mount, containerHome) {
+  const container = mount.container.replace(/\$HOME/g, containerHome);
+  const rwFlag = mount.readonly !== false ? chalk.dim('ro') : chalk.green('rw');
+  console.log(
+    `      ${chalk.yellow('custom'.padEnd(10))} ${chalk.dim(mount.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
+  );
+}
+
+function printDockerMounts(mounts, containerHome) {
+  const presets = mounts.filter((m) => typeof m === 'string');
+  const customMounts = mounts.filter((m) => typeof m === 'object');
+  const mountLabel =
+    customMounts.length > 0
+      ? `Mounts (${presets.length} presets, ${customMounts.length} custom):`
+      : `Mounts (${presets.length} presets):`;
+  console.log(chalk.dim(`    ${mountLabel}`));
+
+  if (mounts.length === 0) {
+    console.log(chalk.dim('      (none)'));
+    return;
+  }
+
+  for (const mount of mounts) {
+    if (typeof mount === 'string') {
+      printPresetMountRow(mount, MOUNT_PRESETS[mount], containerHome);
+    } else {
+      printCustomMountRow(mount, containerHome);
+    }
+  }
+}
+
+function printDockerEnvironment(mounts, envPassthrough) {
+  const resolvedEnvs = resolveEnvs(mounts, envPassthrough);
+  if (resolvedEnvs.length === 0) {
+    console.log(chalk.dim('    Environment: (none)'));
+    return;
+  }
+  console.log(chalk.dim(`    Environment (${resolvedEnvs.length} vars):`));
+  const fromPresets = resolvedEnvs.filter((env) => !envPassthrough.includes(env));
+  if (fromPresets.length > 0) {
+    console.log(`      ${chalk.dim('From presets:')} ${fromPresets.join(', ')}`);
+  }
+  if (envPassthrough.length > 0) {
+    console.log(`      ${chalk.cyan('Explicit:')} ${envPassthrough.join(', ')}`);
+  }
+}
+
+function printDockerContainerHome(containerHome) {
+  const homeIsDefault = containerHome === '/root';
+  const homeLabel = homeIsDefault ? chalk.dim('Container home:') : chalk.cyan('Container home:');
+  const homeVal = homeIsDefault ? chalk.dim(containerHome) : chalk.white(containerHome);
+  console.log(`    ${homeLabel} ${homeVal}`);
+}
+
+function printDockerConfiguration(settings) {
   console.log('');
   console.log(chalk.bold('  Docker Configuration:'));
 
@@ -3286,88 +3365,207 @@ function formatSettingsList(settings, showUsage = false) {
   const mounts = settings.dockerMounts || [];
   const envPassthrough = settings.dockerEnvPassthrough || [];
 
-  // Count presets vs custom mounts
-  const presets = mounts.filter((m) => typeof m === 'string');
-  const customMounts = mounts.filter((m) => typeof m === 'object');
+  printDockerMounts(mounts, containerHome);
+  printDockerEnvironment(mounts, envPassthrough);
+  printDockerContainerHome(containerHome);
+  console.log('');
+}
 
-  // Mounts header with count
-  const mountLabel =
-    customMounts.length > 0
-      ? `Mounts (${presets.length} presets, ${customMounts.length} custom):`
-      : `Mounts (${presets.length} presets):`;
-  console.log(chalk.dim(`    ${mountLabel}`));
+/**
+ * Format settings list with grouped Docker configuration
+ * Docker mounts shown as expanded table instead of raw JSON
+ */
+function formatSettingsList(settings, showUsage = false) {
+  console.log(chalk.bold('\nSettings:\n'));
+  printNonDockerSettings(settings);
+  printDockerConfiguration(settings);
+  if (showUsage) {
+    printSettingsUsage();
+  }
+}
 
-  // Display each mount as a formatted row
-  for (const mount of mounts) {
-    if (typeof mount === 'string') {
-      const preset = MOUNT_PRESETS[mount];
-      if (preset) {
-        const container = preset.container.replace(/\$HOME/g, containerHome);
-        const rwFlag = preset.readonly ? chalk.dim('ro') : chalk.green('rw');
-        console.log(
-          `      ${chalk.cyan(mount.padEnd(10))} ${chalk.dim(preset.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
-        );
-      } else {
-        console.log(`      ${chalk.red(mount.padEnd(10))} ${chalk.red('(unknown preset)')}`);
-      }
-    } else {
-      // Custom mount object
-      const container = mount.container.replace(/\$HOME/g, containerHome);
-      const rwFlag = mount.readonly !== false ? chalk.dim('ro') : chalk.green('rw');
-      console.log(
-        `      ${chalk.yellow('custom'.padEnd(10))} ${chalk.dim(mount.host.padEnd(20))} → ${container.padEnd(24)} (${rwFlag})`
-      );
-    }
+function listConfigFiles() {
+  return fs
+    .readdirSync(path.join(PACKAGE_ROOT, 'cluster-templates'))
+    .filter((file) => file.endsWith('.json'));
+}
+
+function printAvailableConfigs(files) {
+  files.forEach((file) => console.log(chalk.dim(`  - ${file.replace('.json', '')}`)));
+}
+
+function resolveConfigPathForShow(name) {
+  const configName = name.endsWith('.json') ? name : `${name}.json`;
+  const configPath = path.join(PACKAGE_ROOT, 'cluster-templates', configName);
+  if (fs.existsSync(configPath)) {
+    return { configPath, displayName: name.replace('.json', '') };
   }
 
-  if (mounts.length === 0) {
-    console.log(chalk.dim('      (none)'));
-  }
+  console.error(chalk.red(`Config not found: ${configName}`));
+  console.log(chalk.dim('\nAvailable configs:'));
+  printAvailableConfigs(listConfigFiles());
+  process.exit(1);
+}
 
-  // Environment variables (resolved from presets + explicit)
-  const resolvedEnvs = resolveEnvs(mounts, envPassthrough);
-  if (resolvedEnvs.length > 0) {
-    console.log(chalk.dim(`    Environment (${resolvedEnvs.length} vars):`));
-    // Group by source for clarity
-    const fromPresets = resolvedEnvs.filter((e) => !envPassthrough.includes(e));
-    const explicit = envPassthrough;
+function printConfigHeader(name) {
+  console.log('');
+  console.log(chalk.bold.cyan('═'.repeat(80)));
+  console.log(chalk.bold.cyan(`  Config: ${name}`));
+  console.log(chalk.bold.cyan('═'.repeat(80)));
+  console.log('');
+}
 
-    if (fromPresets.length > 0) {
-      console.log(`      ${chalk.dim('From presets:')} ${fromPresets.join(', ')}`);
-    }
-    if (explicit.length > 0) {
-      console.log(`      ${chalk.cyan('Explicit:')} ${explicit.join(', ')}`);
-    }
+function printConfigFooter() {
+  console.log(chalk.bold.cyan('═'.repeat(80)));
+  console.log('');
+}
+
+function getAgentsDir() {
+  return path.join(PACKAGE_ROOT, 'src', 'agents');
+}
+
+function printAgentsJson(agents) {
+  console.log(JSON.stringify({ agents, error: null }, null, 2));
+}
+
+function reportMissingAgentsDir(options) {
+  if (options.json) {
+    printAgentsJson([]);
   } else {
-    console.log(chalk.dim('    Environment: (none)'));
+    console.log(chalk.dim('No agents directory found.'));
+  }
+}
+
+function reportNoAgents(options) {
+  if (options.json) {
+    printAgentsJson([]);
+  } else {
+    console.log(chalk.dim('No agent definitions found in src/agents/'));
+  }
+}
+
+function parseAgentFile(file, agentsDir) {
+  try {
+    const agentPath = path.join(agentsDir, file);
+    const agent = JSON.parse(fs.readFileSync(agentPath, 'utf8'));
+    return {
+      file: file.replace('.json', ''),
+      id: agent.id || file.replace('.json', ''),
+      role: agent.role || 'unspecified',
+      model: agent.model || 'default',
+      triggers: agent.triggers?.length || 0,
+      prompt: agent.prompt || null,
+      output: agent.output || null,
+    };
+  } catch (err) {
+    console.error(chalk.yellow(`Warning: Could not parse ${file}: ${err.message}`));
+    return null;
+  }
+}
+
+function loadAgentDefinitions(files, agentsDir) {
+  const agents = [];
+  for (const file of files) {
+    const agent = parseAgentFile(file, agentsDir);
+    if (agent) {
+      agents.push(agent);
+    }
+  }
+  return agents;
+}
+
+function printAgentsList(agents) {
+  console.log(chalk.bold('\nAvailable agent definitions:\n'));
+  for (const agent of agents) {
+    console.log(
+      `  ${chalk.cyan(agent.id.padEnd(25))} ${chalk.dim('role:')} ${agent.role.padEnd(20)} ${chalk.dim('model:')} ${agent.model}`
+    );
+    console.log(chalk.dim(`    Triggers: ${agent.triggers}`));
+    if (agent.output) {
+      const outputTopic = typeof agent.output === 'object' ? agent.output.topic : null;
+      console.log(chalk.dim(`    Output topic: ${outputTopic || 'none'}`));
+    }
+    if (agent.prompt) {
+      const promptPreview = agent.prompt.substring(0, 100).replace(/\n/g, ' ');
+      console.log(chalk.dim(`    Prompt: ${promptPreview}...`));
+    }
+    console.log('');
+  }
+}
+
+function getTriggerTopics(triggers) {
+  return triggers
+    .map((trigger) => (typeof trigger === 'string' ? trigger : trigger.topic))
+    .filter(Boolean);
+}
+
+function printAgentDetails(agent) {
+  const color = getColorForSender(agent.id);
+  console.log(color.bold(`  ${agent.id}`));
+  console.log(chalk.dim(`    Role: ${agent.role || 'none'}`));
+
+  if (agent.model) {
+    console.log(chalk.dim(`    Model: ${agent.model}`));
   }
 
-  // Container home
-  const homeIsDefault = containerHome === '/root';
-  const homeLabel = homeIsDefault ? chalk.dim('Container home:') : chalk.cyan('Container home:');
-  const homeVal = homeIsDefault ? chalk.dim(containerHome) : chalk.white(containerHome);
-  console.log(`    ${homeLabel} ${homeVal}`);
+  if (agent.triggers && agent.triggers.length > 0) {
+    const triggerTopics = getTriggerTopics(agent.triggers);
+    console.log(chalk.dim(`    Triggers: ${triggerTopics.join(', ')}`));
+  } else {
+    console.log(chalk.dim(`    Triggers: none (manual only)`));
+  }
 
   console.log('');
+}
 
-  if (showUsage) {
-    console.log(chalk.dim('Usage:'));
-    console.log(chalk.dim('  zeroshot settings set <key> <value>'));
-    console.log(chalk.dim('  zeroshot settings get <key>'));
-    console.log(chalk.dim('  zeroshot settings reset'));
-    console.log('');
-    console.log(chalk.dim('Examples:'));
-    console.log(chalk.dim('  zeroshot settings set maxModel opus'));
-    console.log(chalk.dim('  zeroshot settings set dockerMounts \'["gh","git","ssh","aws"]\''));
-    console.log(chalk.dim('  zeroshot settings set dockerEnvPassthrough \'["AWS_*","TF_VAR_*"]\''));
-    console.log('');
-    console.log(
-      chalk.dim(
-        'Available mount presets: gh, git, ssh, aws, azure, kube, terraform, gcloud, claude, codex, gemini'
-      )
-    );
-    console.log('');
+function printAgentsSection(agents) {
+  console.log(chalk.bold('Agents:\n'));
+  if (!agents || agents.length === 0) {
+    console.log(chalk.dim('  No agents defined'));
+    return;
   }
+  for (const agent of agents) {
+    printAgentDetails(agent);
+  }
+}
+
+function buildTriggerMap(agents) {
+  const triggerMap = new Map();
+  for (const agent of agents) {
+    if (!agent.triggers) {
+      continue;
+    }
+    for (const trigger of agent.triggers) {
+      const topic = typeof trigger === 'string' ? trigger : trigger.topic;
+      if (!topic) {
+        continue;
+      }
+      if (!triggerMap.has(topic)) {
+        triggerMap.set(topic, []);
+      }
+      triggerMap.get(topic).push(agent.id);
+    }
+  }
+  return triggerMap;
+}
+
+function printMessageFlow(agents) {
+  if (!agents || agents.length === 0) {
+    return;
+  }
+
+  console.log(chalk.bold('Message Flow:\n'));
+  const triggerMap = buildTriggerMap(agents);
+  if (triggerMap.size === 0) {
+    console.log(chalk.dim('  No automatic triggers defined\n'));
+    return;
+  }
+
+  for (const [topic, agentIds] of triggerMap) {
+    const coloredAgents = agentIds.map((id) => getColorForSender(id)(id)).join(', ');
+    console.log(`  ${chalk.yellow(topic)} ${chalk.dim('→')} ${coloredAgents}`);
+  }
+  console.log('');
 }
 
 settingsCmd
@@ -3666,92 +3864,13 @@ configCmd
   .description('Visualize a cluster config')
   .action((name) => {
     try {
-      // Support both with and without .json extension
-      const configName = name.endsWith('.json') ? name : `${name}.json`;
-      const configPath = path.join(PACKAGE_ROOT, 'cluster-templates', configName);
-
-      if (!fs.existsSync(configPath)) {
-        console.error(chalk.red(`Config not found: ${configName}`));
-        console.log(chalk.dim('\nAvailable configs:'));
-        const files = fs
-          .readdirSync(path.join(PACKAGE_ROOT, 'cluster-templates'))
-          .filter((f) => f.endsWith('.json'));
-        files.forEach((f) => console.log(chalk.dim(`  - ${f.replace('.json', '')}`)));
-        process.exit(1);
-      }
-
+      const { configPath, displayName } = resolveConfigPathForShow(name);
       const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-      // Header
-      console.log('');
-      console.log(chalk.bold.cyan('═'.repeat(80)));
-      console.log(chalk.bold.cyan(`  Config: ${name.replace('.json', '')}`));
-      console.log(chalk.bold.cyan('═'.repeat(80)));
-      console.log('');
-
-      // Agents section
-      console.log(chalk.bold('Agents:\n'));
-
-      if (!config.agents || config.agents.length === 0) {
-        console.log(chalk.dim('  No agents defined'));
-      } else {
-        for (const agent of config.agents) {
-          const color = getColorForSender(agent.id);
-          console.log(color.bold(`  ${agent.id}`));
-          console.log(chalk.dim(`    Role: ${agent.role || 'none'}`));
-
-          if (agent.model) {
-            console.log(chalk.dim(`    Model: ${agent.model}`));
-          }
-
-          if (agent.triggers && agent.triggers.length > 0) {
-            // Triggers are objects with topic field
-            const triggerTopics = agent.triggers
-              .map((t) => (typeof t === 'string' ? t : t.topic))
-              .filter(Boolean);
-            console.log(chalk.dim(`    Triggers: ${triggerTopics.join(', ')}`));
-          } else {
-            console.log(chalk.dim(`    Triggers: none (manual only)`));
-          }
-
-          console.log('');
-        }
-      }
-
-      // Message flow visualization
-      if (config.agents && config.agents.length > 0) {
-        console.log(chalk.bold('Message Flow:\n'));
-
-        // Build trigger map: topic -> [agents that listen]
-        const triggerMap = new Map();
-        for (const agent of config.agents) {
-          if (agent.triggers) {
-            for (const trigger of agent.triggers) {
-              const topic = typeof trigger === 'string' ? trigger : trigger.topic;
-              if (topic) {
-                if (!triggerMap.has(topic)) {
-                  triggerMap.set(topic, []);
-                }
-                triggerMap.get(topic).push(agent.id);
-              }
-            }
-          }
-        }
-
-        if (triggerMap.size === 0) {
-          console.log(chalk.dim('  No automatic triggers defined\n'));
-        } else {
-          for (const [topic, agents] of triggerMap) {
-            console.log(
-              `  ${chalk.yellow(topic)} ${chalk.dim('→')} ${agents.map((a) => getColorForSender(a)(a)).join(', ')}`
-            );
-          }
-          console.log('');
-        }
-      }
-
-      console.log(chalk.bold.cyan('═'.repeat(80)));
-      console.log('');
+      printConfigHeader(displayName);
+      printAgentsSection(config.agents);
+      printMessageFlow(config.agents);
+      printConfigFooter();
     } catch (error) {
       console.error('Error showing config:', error.message);
       process.exit(1);
@@ -3830,81 +3949,39 @@ agentsCmd
   .option('--json', 'Output as JSON')
   .action((options) => {
     try {
-      const agentsDir = path.join(PACKAGE_ROOT, 'src', 'agents');
-
-      // Check if agents directory exists
+      const agentsDir = getAgentsDir();
       if (!fs.existsSync(agentsDir)) {
-        if (options.json) {
-          console.log(JSON.stringify({ agents: [], error: null }, null, 2));
-        } else {
-          console.log(chalk.dim('No agents directory found.'));
-        }
+        reportMissingAgentsDir(options);
         return;
       }
 
-      const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith('.json'));
-
+      const files = fs.readdirSync(agentsDir).filter((file) => file.endsWith('.json'));
       if (files.length === 0) {
-        if (options.json) {
-          console.log(JSON.stringify({ agents: [], error: null }, null, 2));
-        } else {
-          console.log(chalk.dim('No agent definitions found in src/agents/'));
-        }
+        reportNoAgents(options);
         return;
       }
 
-      // Parse all agent files
-      const agents = [];
-      for (const file of files) {
-        try {
-          const agentPath = path.join(agentsDir, file);
-          const agent = JSON.parse(fs.readFileSync(agentPath, 'utf8'));
-          agents.push({
-            file: file.replace('.json', ''),
-            id: agent.id || file.replace('.json', ''),
-            role: agent.role || 'unspecified',
-            model: agent.model || 'default',
-            triggers: agent.triggers?.length || 0,
-            prompt: agent.prompt || null,
-            output: agent.output || null,
-          });
-        } catch (err) {
-          // Skip invalid JSON files
-          console.error(chalk.yellow(`Warning: Could not parse ${file}: ${err.message}`));
-        }
-      }
+      const agents = loadAgentDefinitions(files, agentsDir);
+      agents.sort((a, b) => a.id.localeCompare(b.id));
 
-      // JSON output
       if (options.json) {
-        console.log(JSON.stringify({ agents, error: null }, null, 2));
+        printAgentsJson(agents);
         return;
       }
 
-      // Human-readable output
-      console.log(chalk.bold('\nAvailable agent definitions:\n'));
+      if (options.verbose) {
+        printAgentsList(agents);
+        return;
+      }
 
+      console.log(chalk.bold('\nAvailable agent definitions:\n'));
       for (const agent of agents) {
         console.log(
           `  ${chalk.cyan(agent.id.padEnd(25))} ${chalk.dim('role:')} ${agent.role.padEnd(20)} ${chalk.dim('model:')} ${agent.model}`
         );
-
-        if (options.verbose) {
-          console.log(chalk.dim(`    Triggers: ${agent.triggers}`));
-          if (agent.output) {
-            console.log(chalk.dim(`    Output topic: ${agent.output.topic || 'none'}`));
-          }
-          if (agent.prompt) {
-            const promptPreview = agent.prompt.substring(0, 100).replace(/\n/g, ' ');
-            console.log(chalk.dim(`    Prompt: ${promptPreview}...`));
-          }
-          console.log('');
-        }
       }
-
-      if (!options.verbose) {
-        console.log('');
-        console.log(chalk.dim('  Use --verbose for full details'));
-      }
+      console.log('');
+      console.log(chalk.dim('  Use --verbose for full details'));
       console.log('');
     } catch (error) {
       if (options.json) {
@@ -4063,59 +4140,67 @@ function getToolIcon(toolName) {
   return icons[toolName] || '🔧';
 }
 
+function formatToolCallPath(filePath) {
+  return filePath ? filePath.split('/').slice(-2).join('/') : '';
+}
+
+function formatTodoWriteCall(todos) {
+  if (!Array.isArray(todos) || todos.length === 0) return '';
+
+  const statusCounts = {};
+  for (const todo of todos) {
+    statusCounts[todo.status] = (statusCounts[todo.status] || 0) + 1;
+  }
+
+  const parts = Object.entries(statusCounts).map(
+    ([status, count]) => `${count} ${status.replace('_', ' ')}`
+  );
+  return `${todos.length} todo${todos.length === 1 ? '' : 's'} (${parts.join(', ')})`;
+}
+
+function formatAskUserQuestionCall(questions) {
+  if (!Array.isArray(questions) || questions.length === 0) return '';
+
+  const question = questions[0];
+  const preview = question.question.substring(0, 50);
+  return questions.length > 1
+    ? `${questions.length} questions: "${preview}..."`
+    : `"${preview}${question.question.length > 50 ? '...' : ''}"`;
+}
+
+function formatToolCallFallback(input) {
+  const keys = Object.keys(input);
+  if (keys.length === 0) return '';
+  const rawValue = String(input[keys[0]]);
+  const preview = rawValue.substring(0, 40);
+  return preview.length < rawValue.length ? preview + '...' : preview;
+}
+
+const TOOL_CALL_INPUT_FORMATTERS = {
+  Bash: (input) => (input.command ? `$ ${input.command}` : ''),
+  Read: (input) => formatToolCallPath(input.file_path),
+  Write: (input) => (input.file_path ? `→ ${formatToolCallPath(input.file_path)}` : ''),
+  Edit: (input) => formatToolCallPath(input.file_path),
+  Glob: (input) => input.pattern || '',
+  Grep: (input) => (input.pattern ? `/${input.pattern}/` : ''),
+  WebFetch: (input) => (input.url ? input.url.substring(0, 50) : ''),
+  WebSearch: (input) => (input.query ? `"${input.query}"` : ''),
+  Task: (input) => input.description || '',
+  TodoWrite: (input) => formatTodoWriteCall(input.todos),
+  AskUserQuestion: (input) => formatAskUserQuestionCall(input.questions),
+};
+
 // Format tool call input for display
 function formatToolCall(toolName, input) {
   if (!input) return '';
 
-  switch (toolName) {
-    case 'Bash':
-      return input.command ? `$ ${input.command}` : '';
-    case 'Read':
-      return input.file_path ? input.file_path.split('/').slice(-2).join('/') : '';
-    case 'Write':
-      return input.file_path ? `→ ${input.file_path.split('/').slice(-2).join('/')}` : '';
-    case 'Edit':
-      return input.file_path ? input.file_path.split('/').slice(-2).join('/') : '';
-    case 'Glob':
-      return input.pattern || '';
-    case 'Grep':
-      return input.pattern ? `/${input.pattern}/` : '';
-    case 'WebFetch':
-      return input.url ? input.url.substring(0, 50) : '';
-    case 'WebSearch':
-      return input.query ? `"${input.query}"` : '';
-    case 'Task':
-      return input.description || '';
-    case 'TodoWrite':
-      if (input.todos && Array.isArray(input.todos)) {
-        const statusCounts = {};
-        input.todos.forEach((todo) => {
-          statusCounts[todo.status] = (statusCounts[todo.status] || 0) + 1;
-        });
-        const parts = Object.entries(statusCounts).map(
-          ([status, count]) => `${count} ${status.replace('_', ' ')}`
-        );
-        return `${input.todos.length} todo${input.todos.length === 1 ? '' : 's'} (${parts.join(', ')})`;
-      }
-      return '';
-    case 'AskUserQuestion':
-      if (input.questions && Array.isArray(input.questions)) {
-        const q = input.questions[0];
-        const preview = q.question.substring(0, 50);
-        return input.questions.length > 1
-          ? `${input.questions.length} questions: "${preview}..."`
-          : `"${preview}${q.question.length > 50 ? '...' : ''}"`;
-      }
-      return '';
-    default:
-      // For unknown tools, show first key-value pair
-      const keys = Object.keys(input);
-      if (keys.length > 0) {
-        const val = String(input[keys[0]]).substring(0, 40);
-        return val.length < String(input[keys[0]]).length ? val + '...' : val;
-      }
-      return '';
+  const formatter = TOOL_CALL_INPUT_FORMATTERS[toolName];
+  if (formatter) {
+    return formatter(input);
   }
+
+  // For unknown tools, show first key-value pair
+  return formatToolCallFallback(input);
 }
 
 // Format tool result for display
