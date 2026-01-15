@@ -722,68 +722,14 @@ class Orchestrator {
       // Check agent type: regular agent or subcluster
       // CRITICAL: Inject cwd into each agent config for proper working directory
       // In worktree mode, agents run in the worktree path (not original cwd)
-      const agentCwd = cluster.worktree ? cluster.worktree.path : options.cwd || process.cwd();
-      for (const agentConfig of config.agents) {
-        // Inject cwd if not already set (config may override)
-        if (!agentConfig.cwd) {
-          agentConfig.cwd = agentCwd;
-        }
-
-        // Apply model override if set (for consistency across all agents)
-        if (options.modelOverride) {
-          applyModelOverride(agentConfig, options.modelOverride);
-          this._log(`    [model] Overridden model for ${agentConfig.id}: ${options.modelOverride}`);
-        }
-
-        const agentOptions = {
-          testMode: options.testMode || !!this.taskRunner, // Enable testMode if taskRunner provided
-          quiet: this.quiet,
-          modelOverride: options.modelOverride || null,
-        };
-
-        // Inject mock spawn function if provided (legacy mockExecutor API)
-        if (options.mockExecutor) {
-          agentOptions.mockSpawnFn = options.mockExecutor.createMockSpawnFn(agentConfig.id);
-        }
-
-        // TaskRunner DI - new pattern for mocking task execution
-        // Creates a mockSpawnFn wrapper that delegates to the taskRunner
-        if (this.taskRunner) {
-          // CRITICAL: agent is a closure variable capturing the AgentWrapper instance
-          // We cannot access agent._selectModel() here because agent doesn't exist yet
-          // Solution: Pass a factory function that will be called when agent is available
-          agentOptions.taskRunner = this.taskRunner;
-        }
-
-        // Pass isolation context if enabled
-        if (cluster.isolation) {
-          agentOptions.isolation = {
-            enabled: true,
-            manager: isolationManager,
-            clusterId,
-          };
-        }
-
-        // Pass worktree context if enabled (lightweight isolation without Docker)
-        if (cluster.worktree) {
-          agentOptions.worktree = {
-            enabled: true,
-            path: cluster.worktree.path,
-            branch: cluster.worktree.branch,
-            repoRoot: cluster.worktree.repoRoot,
-          };
-        }
-
-        // Create agent or subcluster wrapper based on type
-        let agent;
-        if (agentConfig.type === 'subcluster') {
-          agent = new SubClusterWrapper(agentConfig, messageBus, cluster, agentOptions);
-        } else {
-          agent = new AgentWrapper(agentConfig, messageBus, cluster, agentOptions);
-        }
-
-        cluster.agents.push(agent);
-      }
+      this._initializeClusterAgents(
+        config,
+        cluster,
+        messageBus,
+        options,
+        isolationManager,
+        clusterId
+      );
 
       // ========================================================================
       // CRITICAL ORDERING INVARIANT (Issue #31 - Subscription Race Condition)
@@ -1094,6 +1040,59 @@ class Orchestrator {
       }
       console.error(`Cluster ${clusterId} failed to start:`, error);
       throw error;
+    }
+  }
+
+  _initializeClusterAgents(config, cluster, messageBus, options, isolationManager, clusterId) {
+    const agentCwd = cluster.worktree ? cluster.worktree.path : options.cwd || process.cwd();
+
+    for (const agentConfig of config.agents) {
+      if (!agentConfig.cwd) {
+        agentConfig.cwd = agentCwd;
+      }
+
+      if (options.modelOverride) {
+        applyModelOverride(agentConfig, options.modelOverride);
+        this._log(`    [model] Overridden model for ${agentConfig.id}: ${options.modelOverride}`);
+      }
+
+      const agentOptions = {
+        testMode: options.testMode || !!this.taskRunner,
+        quiet: this.quiet,
+        modelOverride: options.modelOverride || null,
+      };
+
+      if (options.mockExecutor) {
+        agentOptions.mockSpawnFn = options.mockExecutor.createMockSpawnFn(agentConfig.id);
+      }
+
+      if (this.taskRunner) {
+        agentOptions.taskRunner = this.taskRunner;
+      }
+
+      if (cluster.isolation) {
+        agentOptions.isolation = {
+          enabled: true,
+          manager: isolationManager,
+          clusterId,
+        };
+      }
+
+      if (cluster.worktree) {
+        agentOptions.worktree = {
+          enabled: true,
+          path: cluster.worktree.path,
+          branch: cluster.worktree.branch,
+          repoRoot: cluster.worktree.repoRoot,
+        };
+      }
+
+      const agent =
+        agentConfig.type === 'subcluster'
+          ? new SubClusterWrapper(agentConfig, messageBus, cluster, agentOptions)
+          : new AgentWrapper(agentConfig, messageBus, cluster, agentOptions);
+
+      cluster.agents.push(agent);
     }
   }
 
