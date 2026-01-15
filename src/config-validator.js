@@ -1743,6 +1743,115 @@ function validateProviderSettings(provider, providerSettings) {
   }
 }
 
+function resolveAgentProvider(agent, config, settings, errors) {
+  const provider = resolveProviderName(agent, config, settings);
+  if (!VALID_PROVIDERS.includes(provider)) {
+    errors.push(`Agent "${agent.id}" references unknown provider "${provider}"`);
+    return null;
+  }
+  return provider;
+}
+
+function buildProviderContext(provider, settings) {
+  const providerModule = getProvider(provider);
+  const levels = providerModule.getLevelMapping();
+  const catalog = providerModule.getModelCatalog();
+  const providerSettings = settings.providerSettings?.[provider] || {};
+  const minLevel = providerSettings.minLevel;
+  const maxLevel = providerSettings.maxLevel;
+  const rank = (level) => levels[level]?.rank;
+
+  return {
+    providerModule,
+    levels,
+    catalog,
+    providerSettings,
+    minLevel,
+    maxLevel,
+    rank,
+  };
+}
+
+function validateJsonSchemaSupport(agent, provider, warnings) {
+  if (!agent.jsonSchema) return;
+  const cap = CAPABILITIES[provider]?.jsonSchema;
+  if (cap === 'experimental') {
+    warnings.push(
+      `Agent "${agent.id}" uses jsonSchema with ${provider} provider - ` +
+        `this feature is experimental and may not work reliably`
+    );
+  } else if (!cap) {
+    warnings.push(
+      `Agent "${agent.id}" uses jsonSchema but ${provider} provider doesn't support it`
+    );
+  }
+}
+
+function validateModelLevelSupport(agent, provider, levels, warnings) {
+  if (agent.modelLevel && !levels[agent.modelLevel]) {
+    warnings.push(
+      `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" which is not valid for ${provider}`
+    );
+  }
+}
+
+function validateModelSelection(agent, provider, catalog, minLevel, maxLevel, rank, warnings) {
+  if (agent.model) {
+    if (!catalog[agent.model]) {
+      warnings.push(
+        `Agent "${agent.id}" uses model "${agent.model}" which is not valid for ${provider}`
+      );
+    }
+    return;
+  }
+
+  if (agent.modelLevel && minLevel && maxLevel) {
+    if (rank(minLevel) > rank(maxLevel)) {
+      warnings.push(
+        `Provider "${provider}" has minLevel "${minLevel}" above maxLevel "${maxLevel}"`
+      );
+    } else if (rank(agent.modelLevel) < rank(minLevel)) {
+      warnings.push(
+        `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" below minLevel "${minLevel}" for ${provider}`
+      );
+    } else if (rank(agent.modelLevel) > rank(maxLevel)) {
+      warnings.push(
+        `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" above maxLevel "${maxLevel}" for ${provider}`
+      );
+    }
+  }
+}
+
+function validateModelRulesSupport(agent, provider, catalog, levels, warnings) {
+  if (!agent.modelRules || !Array.isArray(agent.modelRules)) return;
+
+  for (const rule of agent.modelRules) {
+    if (rule.modelLevel && !levels[rule.modelLevel]) {
+      warnings.push(
+        `Agent "${agent.id}" uses modelLevel "${rule.modelLevel}" in modelRules which is not valid for ${provider}`
+      );
+    }
+    if (rule.model && !catalog[rule.model]) {
+      warnings.push(
+        `Agent "${agent.id}" uses model "${rule.model}" in modelRules which is not valid for ${provider}`
+      );
+    }
+  }
+}
+
+function validateReasoningEffortSupport(agent, provider, warnings) {
+  if (agent.reasoningEffort && !['codex', 'opencode'].includes(provider)) {
+    warnings.push(`Agent "${agent.id}" sets reasoningEffort but ${provider} does not support it`);
+  } else if (
+    agent.reasoningEffort &&
+    !['low', 'medium', 'high', 'xhigh'].includes(agent.reasoningEffort)
+  ) {
+    warnings.push(
+      `Agent "${agent.id}" has invalid reasoningEffort "${agent.reasoningEffort}" (low|medium|high|xhigh)`
+    );
+  }
+}
+
 function validateProviderFeatures(config, settings) {
   const errors = [];
   const warnings = [];
@@ -1766,87 +1875,16 @@ function validateProviderFeatures(config, settings) {
       continue;
     }
 
-    const provider = resolveProviderName(agent, config, settings);
-    if (!VALID_PROVIDERS.includes(provider)) {
-      errors.push(`Agent "${agent.id}" references unknown provider "${provider}"`);
-      continue;
-    }
+    const provider = resolveAgentProvider(agent, config, settings, errors);
+    if (!provider) continue;
 
-    const providerModule = getProvider(provider);
-    const levels = providerModule.getLevelMapping();
-    const catalog = providerModule.getModelCatalog();
-    const providerSettings = settings.providerSettings?.[provider] || {};
-    const minLevel = providerSettings.minLevel;
-    const maxLevel = providerSettings.maxLevel;
-    const rank = (level) => levels[level]?.rank;
+    const { levels, catalog, minLevel, maxLevel, rank } = buildProviderContext(provider, settings);
 
-    if (agent.jsonSchema) {
-      const cap = CAPABILITIES[provider]?.jsonSchema;
-      if (cap === 'experimental') {
-        warnings.push(
-          `Agent "${agent.id}" uses jsonSchema with ${provider} provider - ` +
-            `this feature is experimental and may not work reliably`
-        );
-      } else if (!cap) {
-        warnings.push(
-          `Agent "${agent.id}" uses jsonSchema but ${provider} provider doesn't support it`
-        );
-      }
-    }
-
-    if (agent.modelLevel && !levels[agent.modelLevel]) {
-      warnings.push(
-        `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" which is not valid for ${provider}`
-      );
-    }
-
-    if (agent.model) {
-      if (!catalog[agent.model]) {
-        warnings.push(
-          `Agent "${agent.id}" uses model "${agent.model}" which is not valid for ${provider}`
-        );
-      }
-    } else if (agent.modelLevel && minLevel && maxLevel) {
-      if (rank(minLevel) > rank(maxLevel)) {
-        warnings.push(
-          `Provider "${provider}" has minLevel "${minLevel}" above maxLevel "${maxLevel}"`
-        );
-      } else if (rank(agent.modelLevel) < rank(minLevel)) {
-        warnings.push(
-          `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" below minLevel "${minLevel}" for ${provider}`
-        );
-      } else if (rank(agent.modelLevel) > rank(maxLevel)) {
-        warnings.push(
-          `Agent "${agent.id}" uses modelLevel "${agent.modelLevel}" above maxLevel "${maxLevel}" for ${provider}`
-        );
-      }
-    }
-
-    if (agent.modelRules && Array.isArray(agent.modelRules)) {
-      for (const rule of agent.modelRules) {
-        if (rule.modelLevel && !levels[rule.modelLevel]) {
-          warnings.push(
-            `Agent "${agent.id}" uses modelLevel "${rule.modelLevel}" in modelRules which is not valid for ${provider}`
-          );
-        }
-        if (rule.model && !catalog[rule.model]) {
-          warnings.push(
-            `Agent "${agent.id}" uses model "${rule.model}" in modelRules which is not valid for ${provider}`
-          );
-        }
-      }
-    }
-
-    if (agent.reasoningEffort && !['codex', 'opencode'].includes(provider)) {
-      warnings.push(`Agent "${agent.id}" sets reasoningEffort but ${provider} does not support it`);
-    } else if (
-      agent.reasoningEffort &&
-      !['low', 'medium', 'high', 'xhigh'].includes(agent.reasoningEffort)
-    ) {
-      warnings.push(
-        `Agent "${agent.id}" has invalid reasoningEffort "${agent.reasoningEffort}" (low|medium|high|xhigh)`
-      );
-    }
+    validateJsonSchemaSupport(agent, provider, warnings);
+    validateModelLevelSupport(agent, provider, levels, warnings);
+    validateModelSelection(agent, provider, catalog, minLevel, maxLevel, rank, warnings);
+    validateModelRulesSupport(agent, provider, catalog, levels, warnings);
+    validateReasoningEffortSupport(agent, provider, warnings);
   }
 
   return { errors, warnings };
