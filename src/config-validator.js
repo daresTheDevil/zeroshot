@@ -1391,6 +1391,211 @@ function detectNAgentCycles(config) {
   return { errors, warnings };
 }
 
+function collectAgentIdConflicts(agents, errors) {
+  const allAgentIds = new Map();
+
+  const collectAgentIds = (list, depth = 0) => {
+    if (!list) return;
+
+    for (const agent of list) {
+      if (!agent.id) continue;
+
+      if (allAgentIds.has(agent.id)) {
+        const firstSeenDepth = allAgentIds.get(agent.id);
+        errors.push(
+          `[Gap 11] Duplicate agent ID '${agent.id}' found across cluster hierarchy ` +
+            `(first at depth ${firstSeenDepth}, duplicate at depth ${depth}). ` +
+            `Fix: Ensure all agent IDs are unique across the entire cluster.`
+        );
+      } else {
+        allAgentIds.set(agent.id, depth);
+      }
+
+      if (agent.type === 'subcluster' && agent.config?.agents) {
+        collectAgentIds(agent.config.agents, depth + 1);
+      }
+    }
+  };
+
+  collectAgentIds(agents);
+}
+
+function buildTopicProducers(agents) {
+  const topicProducers = new Map();
+
+  for (const agent of agents) {
+    if (agent.type === 'subcluster') continue;
+    const outputTopic = agent.hooks?.onComplete?.config?.topic;
+    if (!outputTopic) continue;
+
+    if (!topicProducers.has(outputTopic)) {
+      topicProducers.set(outputTopic, []);
+    }
+    topicProducers.get(outputTopic).push(agent.id);
+  }
+
+  return topicProducers;
+}
+
+function validateJsonSchema(prefix, agent, errors) {
+  if (!agent.jsonSchema) return;
+
+  try {
+    JSON.stringify(agent.jsonSchema);
+
+    if (typeof agent.jsonSchema !== 'object') {
+      errors.push(
+        `[Gap 8] ${prefix}: jsonSchema must be an object, got ${typeof agent.jsonSchema}. ` +
+          `Fix: Use valid JSON Schema format with 'type' and 'properties' fields.`
+      );
+    }
+  } catch (error) {
+    errors.push(
+      `[Gap 8] ${prefix}: jsonSchema is not valid JSON: ${error.message}. ` +
+        `Fix: Ensure schema is a valid JSON object.`
+    );
+  }
+}
+
+function validateContextSource(prefix, source, topicProducers, errors, warnings) {
+  const topic = source.topic;
+  if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') return;
+  if (topic.endsWith('*')) return;
+
+  const producers = topicProducers.get(topic) || [];
+  if (producers.length === 0) {
+    warnings.push(
+      `[Gap 9] ${prefix}: Context source topic '${topic}' is never produced. ` +
+        `Agent will get empty context for this source.`
+    );
+  }
+
+  if (source.amount === undefined) {
+    warnings.push(
+      `[Gap 14] ${prefix}: Context source for topic '${topic}' missing 'amount' field. ` +
+        `Defaults may not be what you expect.`
+    );
+  }
+
+  if (source.strategy && !['latest', 'all', 'oldest'].includes(source.strategy)) {
+    errors.push(
+      `[Gap 14] ${prefix}: Context source strategy '${source.strategy}' is invalid. ` +
+        `Fix: Use 'latest', 'all', or 'oldest'.`
+    );
+  }
+}
+
+function validateContextSources(prefix, agent, topicProducers, errors, warnings) {
+  if (!agent.contextStrategy?.sources) return;
+
+  for (const source of agent.contextStrategy.sources) {
+    validateContextSource(prefix, source, topicProducers, errors, warnings);
+  }
+}
+
+function validateIsolationConfig(prefix, agent, path, errors, warnings) {
+  if (!agent.isolation) return;
+
+  if (agent.isolation.type === 'docker') {
+    if (!agent.isolation.image) {
+      errors.push(
+        `[Gap 10] ${prefix}: Docker isolation requires 'image' field. ` +
+          `Fix: Add "image": "zeroshot-runner" or custom image name.`
+      );
+    }
+
+    if (agent.isolation.mounts) {
+      for (const mount of agent.isolation.mounts) {
+        if (mount.host && !path.isAbsolute(mount.host)) {
+          warnings.push(
+            `[Gap 10] ${prefix}: Docker mount host path '${mount.host}' is not absolute. ` +
+              `May cause runtime errors.`
+          );
+        }
+      }
+    }
+
+    return;
+  }
+
+  if (agent.isolation.type && agent.isolation.type !== 'worktree') {
+    errors.push(
+      `[Gap 10] ${prefix}: Unknown isolation type '${agent.isolation.type}'. ` +
+        `Fix: Use 'docker' or 'worktree'.`
+    );
+  }
+}
+
+function validateLoadConfig(prefix, agent, fs, errors) {
+  if (!agent.loadConfig) return;
+  const configPath = agent.loadConfig.path;
+  if (configPath && !fs.existsSync(configPath)) {
+    errors.push(
+      `[Gap 12] ${prefix}: Load config file '${configPath}' does not exist. ` +
+        `Fix: Check file path or remove loadConfig.`
+    );
+  }
+}
+
+function validateTaskExecutor(prefix, agent, errors) {
+  if (!agent.taskExecutor) return;
+
+  if (agent.taskExecutor.command === undefined) {
+    errors.push(
+      `[Gap 13] ${prefix}: Task executor missing 'command' field. ` +
+        `Fix: Add "command": "claude" or custom command.`
+    );
+  }
+
+  if (agent.taskExecutor.retries !== undefined) {
+    if (typeof agent.taskExecutor.retries !== 'number' || agent.taskExecutor.retries < 0) {
+      errors.push(
+        `[Gap 13] ${prefix}: Task executor 'retries' must be a non-negative number, got ${agent.taskExecutor.retries}. ` +
+          `Fix: Use a positive integer or 0.`
+      );
+    }
+  }
+
+  if (agent.taskExecutor.timeout !== undefined) {
+    if (typeof agent.taskExecutor.timeout !== 'number' || agent.taskExecutor.timeout <= 0) {
+      errors.push(
+        `[Gap 13] ${prefix}: Task executor 'timeout' must be a positive number, got ${agent.taskExecutor.timeout}. ` +
+          `Fix: Use a positive number in milliseconds.`
+      );
+    }
+  }
+}
+
+function validateRoleReferences(prefix, agent, roles, errors) {
+  for (const trigger of agent.triggers || []) {
+    if (!trigger.logic?.script) continue;
+    const script = trigger.logic.script;
+    const roleMatches = script.match(/getAgentsByRole\(['"](\w+)['"]\)/g);
+
+    if (!roleMatches) continue;
+
+    for (const match of roleMatches) {
+      const role = match.match(/['"](\w+)['"]/)[1];
+      if (roles.has(role)) continue;
+
+      const isCritical =
+        /\.length\s*[><=!]/.test(script) ||
+        /allResponded/.test(script) ||
+        /hasConsensus/.test(script);
+
+      const hasZeroLengthFallback =
+        /\.length\s*===?\s*0\s*\)\s*return/.test(script) || /\.length\s*[<]=\s*0/.test(script);
+
+      if (isCritical && !hasZeroLengthFallback) {
+        errors.push(
+          `[Gap 15] ${prefix}: Logic references role '${role}' which doesn't exist. ` +
+            `This will cause logic to fail. Fix: Add agent with role '${role}' or update logic.`
+        );
+      }
+    }
+  }
+}
+
 /**
  * Phase 9: Configuration semantic validation
  * Validates configuration fields that can cause runtime failures
@@ -1420,33 +1625,12 @@ function validateConfigSemantics(config) {
   const path = require('path');
 
   // === GAP 11: Agent ID conflicts across subclusters ===
-  // Collect all agent IDs recursively (including subclusters)
-  const allAgentIds = new Map(); // Map of agentId -> depth where first seen
+  collectAgentIdConflicts(config.agents, errors);
 
-  function collectAgentIds(agents, depth = 0) {
-    if (!agents) return;
-
-    for (const agent of agents) {
-      if (!agent.id) continue; // Skip agents without IDs (caught in Phase 1)
-
-      if (allAgentIds.has(agent.id)) {
-        const firstSeenDepth = allAgentIds.get(agent.id);
-        errors.push(
-          `[Gap 11] Duplicate agent ID '${agent.id}' found across cluster hierarchy ` +
-            `(first at depth ${firstSeenDepth}, duplicate at depth ${depth}). ` +
-            `Fix: Ensure all agent IDs are unique across the entire cluster.`
-        );
-      } else {
-        allAgentIds.set(agent.id, depth);
-      }
-
-      if (agent.type === 'subcluster' && agent.config?.agents) {
-        collectAgentIds(agent.config.agents, depth + 1);
-      }
-    }
-  }
-
-  collectAgentIds(config.agents);
+  const topicProducers = buildTopicProducers(config.agents);
+  const roles = new Set(
+    config.agents.filter((agent) => agent.type !== 'subcluster').map((agent) => agent.role)
+  );
 
   for (const agent of config.agents) {
     if (agent.type === 'subcluster') continue;
@@ -1454,176 +1638,24 @@ function validateConfigSemantics(config) {
     const prefix = `Agent '${agent.id}'`;
 
     // === GAP 8: JSON schema structurally invalid ===
-    if (agent.jsonSchema) {
-      try {
-        // Check if schema can be stringified (basic structural check)
-        JSON.stringify(agent.jsonSchema);
-
-        // Check required fields for JSON schema
-        if (typeof agent.jsonSchema !== 'object') {
-          errors.push(
-            `[Gap 8] ${prefix}: jsonSchema must be an object, got ${typeof agent.jsonSchema}. ` +
-              `Fix: Use valid JSON Schema format with 'type' and 'properties' fields.`
-          );
-        }
-      } catch (e) {
-        errors.push(
-          `[Gap 8] ${prefix}: jsonSchema is not valid JSON: ${e.message}. ` +
-            `Fix: Ensure schema is a valid JSON object.`
-        );
-      }
-    }
+    validateJsonSchema(prefix, agent, errors);
 
     // === GAP 9: Context sources never produced (enhanced check) ===
     // Already partially covered in Phase 2, but add stricter checks
-    if (agent.contextStrategy?.sources) {
-      const topicProducers = new Map();
-
-      // Build topic producers map
-      for (const a of config.agents) {
-        if (a.type === 'subcluster') continue;
-        const outputTopic = a.hooks?.onComplete?.config?.topic;
-        if (outputTopic) {
-          if (!topicProducers.has(outputTopic)) {
-            topicProducers.set(outputTopic, []);
-          }
-          topicProducers.get(outputTopic).push(a.id);
-        }
-      }
-
-      for (const source of agent.contextStrategy.sources) {
-        const topic = source.topic;
-        if (topic === 'ISSUE_OPENED' || topic === 'CLUSTER_RESUMED') continue;
-        if (topic.endsWith('*')) continue;
-
-        const producers = topicProducers.get(topic) || [];
-        if (producers.length === 0) {
-          warnings.push(
-            `[Gap 9] ${prefix}: Context source topic '${topic}' is never produced. ` +
-              `Agent will get empty context for this source.`
-          );
-        }
-
-        // === GAP 14: Context source format invalid ===
-        if (source.amount === undefined) {
-          warnings.push(
-            `[Gap 14] ${prefix}: Context source for topic '${topic}' missing 'amount' field. ` +
-              `Defaults may not be what you expect.`
-          );
-        }
-        if (source.strategy && !['latest', 'all', 'oldest'].includes(source.strategy)) {
-          errors.push(
-            `[Gap 14] ${prefix}: Context source strategy '${source.strategy}' is invalid. ` +
-              `Fix: Use 'latest', 'all', or 'oldest'.`
-          );
-        }
-      }
-    }
+    validateContextSources(prefix, agent, topicProducers, errors, warnings);
 
     // === GAP 10: Isolation config invalid ===
-    if (agent.isolation) {
-      if (agent.isolation.type === 'docker') {
-        if (!agent.isolation.image) {
-          errors.push(
-            `[Gap 10] ${prefix}: Docker isolation requires 'image' field. ` +
-              `Fix: Add "image": "zeroshot-runner" or custom image name.`
-          );
-        }
-
-        // Check mount paths are absolute
-        if (agent.isolation.mounts) {
-          for (const mount of agent.isolation.mounts) {
-            if (mount.host && !path.isAbsolute(mount.host)) {
-              warnings.push(
-                `[Gap 10] ${prefix}: Docker mount host path '${mount.host}' is not absolute. ` +
-                  `May cause runtime errors.`
-              );
-            }
-          }
-        }
-      } else if (agent.isolation.type && agent.isolation.type !== 'worktree') {
-        errors.push(
-          `[Gap 10] ${prefix}: Unknown isolation type '${agent.isolation.type}'. ` +
-            `Fix: Use 'docker' or 'worktree'.`
-        );
-      }
-    }
+    validateIsolationConfig(prefix, agent, path, errors, warnings);
 
     // === GAP 12: Load config file paths don't exist ===
-    if (agent.loadConfig) {
-      const configPath = agent.loadConfig.path;
-      if (configPath && !fs.existsSync(configPath)) {
-        errors.push(
-          `[Gap 12] ${prefix}: Load config file '${configPath}' does not exist. ` +
-            `Fix: Check file path or remove loadConfig.`
-        );
-      }
-    }
+    validateLoadConfig(prefix, agent, fs, errors);
 
     // === GAP 13: Task executor config invalid ===
-    if (agent.taskExecutor) {
-      if (agent.taskExecutor.command === undefined) {
-        errors.push(
-          `[Gap 13] ${prefix}: Task executor missing 'command' field. ` +
-            `Fix: Add "command": "claude" or custom command.`
-        );
-      }
-
-      if (agent.taskExecutor.retries !== undefined) {
-        if (typeof agent.taskExecutor.retries !== 'number' || agent.taskExecutor.retries < 0) {
-          errors.push(
-            `[Gap 13] ${prefix}: Task executor 'retries' must be a non-negative number, got ${agent.taskExecutor.retries}. ` +
-              `Fix: Use a positive integer or 0.`
-          );
-        }
-      }
-
-      if (agent.taskExecutor.timeout !== undefined) {
-        if (typeof agent.taskExecutor.timeout !== 'number' || agent.taskExecutor.timeout <= 0) {
-          errors.push(
-            `[Gap 13] ${prefix}: Task executor 'timeout' must be a positive number, got ${agent.taskExecutor.timeout}. ` +
-              `Fix: Use a positive number in milliseconds.`
-          );
-        }
-      }
-    }
+    validateTaskExecutor(prefix, agent, errors);
 
     // === GAP 15: Stricter role reference validation ===
     // Upgrade from WARNING to ERROR when role is used in critical logic
-    const roles = new Set(config.agents.filter((a) => a.type !== 'subcluster').map((a) => a.role));
-
-    for (const trigger of agent.triggers || []) {
-      if (trigger.logic?.script) {
-        const script = trigger.logic.script;
-        const roleMatches = script.match(/getAgentsByRole\(['"](\w+)['"]\)/g);
-
-        if (roleMatches) {
-          for (const match of roleMatches) {
-            const role = match.match(/['"](\w+)['"]/)[1];
-            if (!roles.has(role)) {
-              // Check if the logic depends on this role for critical decisions
-              const isCritical =
-                /\.length\s*[><=!]/.test(script) || // Checking count
-                /allResponded/.test(script) || // Waiting for responses
-                /hasConsensus/.test(script); // Consensus check
-
-              // Check if logic has a valid "zero length" fallback pattern
-              // e.g., "if (validators.length === 0) return true" handles missing role gracefully
-              const hasZeroLengthFallback =
-                /\.length\s*===?\s*0\s*\)\s*return/.test(script) || // length === 0) return
-                /\.length\s*[<]=\s*0/.test(script); // length <= 0 or length < 1
-
-              if (isCritical && !hasZeroLengthFallback) {
-                errors.push(
-                  `[Gap 15] ${prefix}: Logic references role '${role}' which doesn't exist. ` +
-                    `This will cause logic to fail. Fix: Add agent with role '${role}' or update logic.`
-                );
-              }
-            }
-          }
-        }
-      }
-    }
+    validateRoleReferences(prefix, agent, roles, errors);
   }
 
   return { errors, warnings };
